@@ -131,12 +131,15 @@ def _ranges(env, sensor_cfg: SceneEntityCfg, max_range: float) -> tuple[torch.Te
     # Body-frame ray direction from the yaw-aligned sensor.
     yaw = _yaw(env.scene["robot"].data.root_quat_w.torch)
     delta = hits[..., :2] - origin[:, :2].unsqueeze(1)
+    # A miss is NaN. Leaving it in the angle makes the whole clearance term NaN.
+    finite = torch.isfinite(delta).all(dim=-1)
+    delta = torch.where(finite.unsqueeze(-1), delta, torch.zeros_like(delta))
     cos_y = torch.cos(yaw).unsqueeze(1)
     sin_y = torch.sin(yaw).unsqueeze(1)
     bx = cos_y * delta[..., 0] + sin_y * delta[..., 1]
     by = -sin_y * delta[..., 0] + cos_y * delta[..., 1]
     ranges = torch.linalg.norm(torch.stack((bx, by), dim=-1), dim=-1)
-    ranges = torch.where(torch.isfinite(ranges), ranges, torch.full_like(ranges, max_range))
+    ranges = torch.where(finite, ranges, torch.full_like(ranges, max_range))
     ranges = ranges.clamp(max=max_range)
     angles = torch.atan2(by, bx)
     return ranges, angles

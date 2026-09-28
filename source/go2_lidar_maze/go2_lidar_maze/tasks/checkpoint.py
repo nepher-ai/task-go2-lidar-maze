@@ -6,8 +6,7 @@
 """Let Play treat an existing checkpoint path as a file, not a log-directory regex.
 
 ``isaaclab.bat play`` resolves ``agent_cfg.load_checkpoint`` by scanning the
-experiment log directory. The maze Play config sets that field to
-``best_policy/best_policy.pt``. When the value is already a file, return it.
+experiment log directory. When that value is already a file, return it.
 """
 
 from __future__ import annotations

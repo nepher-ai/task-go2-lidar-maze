@@ -198,8 +198,114 @@ def test_play_sources_do_not_import_the_privileged_layout():
                 raise AssertionError(f"{relative} imports maze_layout at module level")
     command = (root / "tasks" / "hl_maze" / "mdp" / "waypoint_command.py").read_text(encoding="utf-8")
     assert "MazeLayout" in command
-    # The only import sits inside the privileged builder, which Play never calls.
+    # The layout import stays inside the privileged builder, so the planner path does not load it.
     assert "from go2_lidar_maze.tasks.hl_maze.maze_layout import MazeLayout" in command
+
+
+def _waypoint_curriculum(n: int = 4):
+    from go2_lidar_maze.tasks.hl_maze.mdp.curriculum import raise_waypoint_distance
+
+    class _Waypoint:
+        def __init__(self):
+            self.issued_count = torch.ones(n)
+            self.reached_count = torch.ones(n)
+            self.k_max = 1
+
+    class _Commands:
+        def __init__(self, waypoint):
+            self._waypoint = waypoint
+
+        def get_term(self, name):
+            return self._waypoint
+
+    class _Terminations:
+        def __init__(self):
+            self.collision = torch.zeros(n, dtype=torch.bool)
+
+        def get_term(self, name):
+            assert name == "collision"
+            return self.collision
+
+    class _Env:
+        def __init__(self):
+            self.waypoint = _Waypoint()
+            self.command_manager = _Commands(self.waypoint)
+            self.termination_manager = _Terminations()
+            self.common_step_counter = 10
+            self.max_episode_length = 600
+
+    env = _Env()
+    return env, raise_waypoint_distance(cfg=None, env=env)
+
+
+def _fill(env, term, *, issued, reached, collided, **kwargs):
+    env.waypoint.issued_count[:] = issued
+    env.waypoint.reached_count[:] = reached
+    env.termination_manager.collision[:] = collided
+    env_ids = list(range(env.waypoint.issued_count.shape[0]))
+    return term(env, env_ids, "waypoint", min_issued=8, min_episodes=4, **kwargs)
+
+
+def test_waypoint_curriculum_ignores_a_single_reset_batch():
+    """The old gate promoted on one batch of 20. That batch must not move ``k_max``."""
+    env, term = _waypoint_curriculum(n=20)
+    reading = term(env, list(range(20)), "waypoint")
+    assert reading["k_max"] == 1.0
+    assert reading["success"] == 1.0
+    assert env.waypoint.k_max == 1
+
+
+def test_waypoint_curriculum_promotes_after_two_clean_windows():
+    env, term = _waypoint_curriculum()
+    # Four issued waypoints is short of min_issued, so the first call only accumulates.
+    assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 1.0
+    first = _fill(env, term, issued=1, reached=1, collided=False)
+    assert first["k_max"] == 1.0
+    assert first["success"] == 1.0
+    assert first["collision"] == 0.0
+    _fill(env, term, issued=1, reached=1, collided=False)
+    assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 2.0
+    # The wait is one episode, even if later windows would have passed.
+    for _ in range(4):
+        assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 2.0
+    env.common_step_counter = 10 + 600
+    for _ in range(3):
+        assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 2.0
+    assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 3.0
+
+
+def test_waypoint_curriculum_resets_the_streak_when_collisions_dominate():
+    env, term = _waypoint_curriculum()
+    _fill(env, term, issued=1, reached=1, collided=False)
+    assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 1.0
+    # A perfect reach rate still fails the window when half the episodes collide.
+    _fill(env, term, issued=1, reached=1, collided=True)
+    blocked = _fill(env, term, issued=1, reached=1, collided=False)
+    assert blocked["collision"] == 0.5
+    assert blocked["k_max"] == 1.0
+    # The failed window cleared the streak, so one clean window is not enough.
+    _fill(env, term, issued=1, reached=1, collided=False)
+    assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 1.0
+    _fill(env, term, issued=1, reached=1, collided=False)
+    assert _fill(env, term, issued=1, reached=1, collided=False)["k_max"] == 2.0
+
+
+def test_waypoint_curriculum_ignores_episodes_with_no_waypoint():
+    env, term = _waypoint_curriculum()
+    env.waypoint.issued_count[:] = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    env.waypoint.reached_count[:] = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    env.termination_manager.collision[:] = torch.tensor([False, False, True, True])
+    reading = term(
+        env,
+        list(range(4)),
+        "waypoint",
+        min_issued=2,
+        min_episodes=2,
+        passes_required=1,
+    )
+    assert reading["success"] == 1.0
+    assert reading["collision"] == 0.0
+    assert reading["k_max"] == 2.0
 
 
 def _bfs_length(neighbours, start: int, goal: int) -> int | None:

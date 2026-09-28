@@ -9,11 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import torch
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
-from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -177,6 +175,8 @@ class HlObservationsCfg:
 
 @configclass
 class HlEventsCfg:
+    # PhysX GPU UInt buffers are written from Go2MazeEnv._init_sim (not a
+    # prestartup event): prestartup is blocked when replicate_physics is True.
     reset_robot = EventTerm(func=hl_mdp.events.reset_go2_in_maze, mode="reset")
     reset_joints = EventTerm(
         func=mdp.reset_joints_by_scale,
@@ -242,18 +242,15 @@ class HlTerminationsCfg:
 class HlCurriculumCfg:
     waypoint_distance = CurrTerm(
         func=hl_mdp.curriculum.raise_waypoint_distance,
-        params={"command_name": "waypoint", "threshold": 0.8},
+        params={
+            "command_name": "waypoint",
+            "threshold": 0.8,
+            "min_issued": 512.0,
+            "min_episodes": 256.0,
+            "max_collision": 0.5,
+            "passes_required": 2,
+        },
     )
-
-
-class Go2MazeEnv(ManagerBasedRLEnv):
-    """Maze env that publishes the goal tensor before the first reset."""
-
-    def __init__(self, cfg: Go2MazeEnvCfg, render_mode: str | None = None, **kwargs):
-        self.goal_xy = torch.zeros((cfg.scene.num_envs, 2), device=cfg.sim.device)
-        self.goal_xy[:, 0] = cfg.goal_xy[0]
-        self.goal_xy[:, 1] = cfg.goal_xy[1]
-        super().__init__(cfg, render_mode, **kwargs)
 
 
 @configclass
@@ -286,8 +283,10 @@ class Go2MazeEnvCfg(ManagerBasedRLEnvCfg):
                 gpu_max_rigid_patch_count=10 * 2**15,
                 gpu_collision_stack_size=2**28,
                 gpu_found_lost_pairs_capacity=2**25,
-                gpu_total_aggregate_pairs_capacity=2**25,
-                gpu_found_lost_aggregate_pairs_capacity=2**25,
+                # 1024 robots share one maze. PhysX asked for 36150475 aggregate pairs,
+                # which is past 2**25.
+                gpu_total_aggregate_pairs_capacity=2**26,
+                gpu_found_lost_aggregate_pairs_capacity=2**26,
             )
         )
         self.scene.contact_forces.update_period = self.sim.dt
@@ -295,7 +294,16 @@ class Go2MazeEnvCfg(ManagerBasedRLEnvCfg):
 
 @configclass
 class Go2MazeEnvCfg_PLAY(Go2MazeEnvCfg):
-    """Deployment. Waypoints come from the LiDAR A* planner. No maze path is loaded."""
+    """Training task with one environment. Privileged waypoints in the shared maze."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+
+
+@configclass
+class Go2MazeEnvCfg_PLANNER(Go2MazeEnvCfg):
+    """Online LiDAR planner. Start and goal come from the maze text file, not its path."""
 
     def __post_init__(self):
         super().__post_init__()

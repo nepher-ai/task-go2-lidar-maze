@@ -16,7 +16,6 @@ from collections.abc import Sequence
 
 import torch
 
-from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm
 from isaaclab.utils import configclass
 from isaaclab.managers import CommandTermCfg
@@ -42,7 +41,7 @@ class WaypointCommand(CommandTerm):
 
     def __init__(self, cfg: WaypointCommandCfg, env):
         super().__init__(cfg, env)
-        self.robot: Articulation = env.scene[cfg.asset_name]
+        self.robot = env.scene[cfg.asset_name]
         self.waypoint_w = torch.zeros(self.num_envs, 2, device=self.device)
         self.path_xy = torch.zeros(self.num_envs, _MAX_POINTS, 2, device=self.device)
         self.s_bar = torch.zeros(self.num_envs, device=self.device)

@@ -8,7 +8,7 @@ Three pieces:
 - **High-level policy.** One waypoint plus a 360° LiDAR scan in, a velocity command out. An LSTM actor-critic, because a waypoint up to five cells away can sit behind a corner the current scan cannot see.
 - **Planner.** At deployment the map starts empty. LiDAR hits fill an occupancy grid, A* plans to the goal, and the policy is given one waypoint on that path.
 
-Training waypoints come from a privileged A* on the maze graph. Play never reads that graph and never reads the `path:` line in the maze text file. It parses only `start_x`, `start_y`, `end_x`, `end_y`.
+Training and `Nepher-Go2-LidarMaze-HL-Play-v0` take waypoints from a privileged A* on the maze graph. `Nepher-Go2-LidarMaze-Planner-Play-v0` never reads that graph and never reads the `path:` line in the maze text file. It parses only `start_x`, `start_y`, `end_x`, `end_y`.
 
 The maze USD is spawned once, at `/World/Maze`. Every environment shares it (`env_spacing = 0`, robot-robot collisions filtered). The LiDAR ray-casts only that mesh, so robots do not see each other.
 
@@ -20,7 +20,7 @@ From `f:\isaacLab`, in PowerShell. This machine has no `uv`. The downloaded Isaa
 .\isaaclab.bat -p -m pip install -e source\task-go2-lidar-maze\source\go2_lidar_maze
 ```
 
-`isaaclab.bat train` and `play` discover these through the `isaaclab.tasks` entry point. `scripts/environments/list_envs.py` only prints ids that contain `Isaac`, so these four do not appear in that table.
+`isaaclab.bat train` and `play` discover these through the `isaaclab.tasks` entry point. `scripts/environments/list_envs.py` only prints ids that contain `Isaac`, so these five do not appear in that table.
 
 TensorBoard logs are under this project, not `F:\isaacLab\logs`. From `f:\isaacLab`:
 
@@ -35,7 +35,8 @@ Gym ids:
 | `Nepher-Go2-LidarMaze-LL-v0` | Train the velocity policy |
 | `Nepher-Go2-LidarMaze-LL-Play-v0` | Play it, at the final command ranges |
 | `Nepher-Go2-LidarMaze-HL-v0` | Train the maze policy on privileged waypoints |
-| `Nepher-Go2-LidarMaze-HL-Play-v0` | Deploy it. Online planner, start and goal from the text file |
+| `Nepher-Go2-LidarMaze-HL-Play-v0` | Play that task with one environment. Loads the latest high-level checkpoint |
+| `Nepher-Go2-LidarMaze-Planner-Play-v0` | Same policy with the online planner. Start and goal from the text file |
 
 ## Train
 
@@ -46,18 +47,12 @@ Isaac Lab 3 does not have a `--headless` flag. `--viz none` runs without a windo
 .\isaaclab.bat -p source\task-go2-lidar-maze\scripts\export_ll_policy.py --checkpoint PATH\model.pt
 .\isaaclab.bat train --task Nepher-Go2-LidarMaze-HL-v0 --viz none
 .\isaaclab.bat play --task Nepher-Go2-LidarMaze-HL-Play-v0 --viz none
+.\isaaclab.bat play --task Nepher-Go2-LidarMaze-Planner-Play-v0 --viz none
 ```
 
-`export_ll_policy.py` writes the TorchScript file `best_policy/ll_policy/ll_policy.pt`. The high-level task loads that file as the frozen velocity policy and raises `FileNotFoundError` until it exists. Copy the trained high-level checkpoint to `best_policy/best_policy.pt`. `Nepher-Go2-LidarMaze-HL-Play-v0` loads that file unless you pass `--checkpoint`.
+`export_ll_policy.py` writes the TorchScript file `best_policy/ll_policy/ll_policy.pt`. The high-level task loads that file as the frozen velocity policy and raises `FileNotFoundError` until it exists. High-level play loads the latest `model_*.pt` under `logs/go2_lidar_maze_hl` unless you pass `--checkpoint`.
 
 While playing the low-level policy, measure the realized deceleration `a_b` and the tracking lag `tau_ll`. The braking reward uses `a_b = 2.5 m/s²` and `tau = 0.2 s` until those measurements replace them (`BRAKE_DECEL_MPS2` and `BRAKE_LATENCY_S` in `constants.py`).
-
-`scripts/navigate_maze.py` runs the online planner from (41.5, 1.5) to (49, 49) with `best_policy/best_policy.pt`. Pass `--checkpoint` to use a different high-level checkpoint.
-
-```powershell
-.\isaaclab.bat -p source\task-go2-lidar-maze\scripts\navigate_maze.py
-.\isaaclab.bat -p source\task-go2-lidar-maze\scripts\navigate_maze.py --checkpoint PATH\model.pt
-```
 
 ## Timing
 
@@ -69,7 +64,7 @@ One cell is 2.5 m. The A* path from the robot to the active waypoint is 1 to 5 c
 
 The waypoint is held until the robot is within 0.5 m, then the next one is issued without resetting the episode. At deployment the waypoint is also dropped early if it lands in an occupied or inflated cell, or if newly discovered walls push its A* length past 5 cells. The path is rebuilt every 2 s.
 
-Training samples the length uniformly from 1 to `k_max`. `k_max` starts at 1 and increases by one cell when the resetting batch reaches more than 80% of its waypoints. Spawn and waypoint positions are the cell centre plus ±0.4 m of jitter.
+Training samples the length uniformly from 1 to `k_max`. `k_max` starts at 1. A window pools resetting episodes until it has 256 of them and at least 512 issued waypoints; episodes with no waypoint yet are left out. The window passes when those episodes reached at least 80% of the waypoints they were issued and fewer than half of them collided. `k_max` increases by one cell after two passing windows in a row, then waits out one episode so the next window is commanded at the new length. Spawn and waypoint positions are the cell centre plus ±0.4 m of jitter.
 
 ## Low-level reward
 
@@ -129,4 +124,4 @@ Each waypoint has a time budget `clip(L / 0.5 + 5, 10, 30)` seconds. Exceeding i
 .\isaaclab.bat -p -m pytest source\task-go2-lidar-maze\tests
 ```
 
-The tests do not start the simulator. They check the action map and the rate limit, polyline projection and the high-water mark, `v_safe` against the hand calculation, `C > p_max / (1 - γ)`, A* against BFS on the cell graph and against Dijkstra on a small occupancy grid, privileged samples of 1 to 5 cells, the online lookahead, and that Play's parser and imports never take the maze path.
+The tests do not start the simulator. They check the action map and the rate limit, polyline projection and the high-water mark, `v_safe` against the hand calculation, `C > p_max / (1 - γ)`, A* against BFS on the cell graph and against Dijkstra on a small occupancy grid, privileged samples of 1 to 5 cells, the online lookahead, and that the planner parser and imports never take the maze path.

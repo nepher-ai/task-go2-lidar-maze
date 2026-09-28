@@ -15,6 +15,37 @@ from isaaclab.managers import SceneEntityCfg
 from go2_lidar_maze.constants import CELL_CENTER_ORIGIN_M, CELL_PITCH_M, GRID_SIZE, SPAWN_JITTER_M
 
 
+def enlarge_physx_aggregate_pairs(env, env_ids=None) -> None:
+    """Rewrite GPU pair buffers as ``UInt`` before the first physics play.
+
+    ``PhysxCfg`` writes these through ``safe_set_attribute_on_usd_prim``, which
+    creates signed ``Int`` attributes. PhysX only reads the ``UInt`` schema
+    names (same path as ``ovphysx_manager``), so the raised capacities never
+    took effect and 1024 shared-maze robots overflowed the default 2**25
+    aggregate buffer.
+
+    Called from :class:`~go2_lidar_maze.tasks.hl_maze.maze_env.Go2MazeEnv`
+    immediately before ``sim.reset()``. Not registered as a ``prestartup``
+    event: that mode is rejected when ``replicate_physics`` is True.
+    """
+    from pxr import Sdf
+
+    del env_ids  # unused; kept so the helper can still be used as an EventTerm
+    prim = env.sim.stage.GetPrimAtPath(env.sim.cfg.physics_prim_path)
+    # Values match Go2MazeEnvCfg PhysxCfg. Aggregate capacities must clear 3.6e7.
+    for name, value in (
+        ("physxScene:gpuFoundLostAggregatePairsCapacity", 2**26),
+        ("physxScene:gpuTotalAggregatePairsCapacity", 2**26),
+        ("physxScene:gpuFoundLostPairsCapacity", 2**25),
+        ("physxScene:gpuMaxRigidPatchCount", 10 * 2**15),
+        ("physxScene:gpuCollisionStackSize", 2**28),
+    ):
+        existing = prim.GetAttribute(name)
+        if existing.IsValid() and existing.GetTypeName() != Sdf.ValueTypeNames.UInt:
+            prim.RemoveProperty(name)
+        prim.CreateAttribute(name, Sdf.ValueTypeNames.UInt).Set(value)
+
+
 def reset_go2_in_maze(
     env,
     env_ids: torch.Tensor,
