@@ -1,0 +1,22 @@
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Omniverse
+**/*.dmp
+**/.thumbs
+
+# OS and editors
+.DS_Store
+Thumbs.db
+**/.idea/
+**/.vscode/
+
+# Training runs and exported policies
+/logs/
+/best_policy/**/*.pt
+/best_policy/**/*.onnx

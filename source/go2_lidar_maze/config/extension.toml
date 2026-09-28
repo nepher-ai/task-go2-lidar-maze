@@ -1,0 +1,22 @@
+[package]
+
+version = "0.1.0"
+category = "isaaclab"
+readme = "README.md"
+
+title = "Go2 LiDAR Maze Navigation"
+author = "Nepher Robotics"
+maintainer = "Nepher Robotics"
+description = "Hierarchical LiDAR maze navigation for the Unitree Go2. A frozen velocity policy tracks commands from a high-level policy that follows one A* waypoint at a time."
+repository = ""
+keywords = ["go2", "unitree", "navigation", "lidar", "maze", "isaaclab"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_rl" = {}
+
+[[python.module]]
+name = "go2_lidar_maze"
+
+[isaac_lab_settings]

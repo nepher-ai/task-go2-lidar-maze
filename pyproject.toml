@@ -1,0 +1,9 @@
+# This file is not the install target. Install the package with:
+#   .\isaaclab.bat -p -m pip install -e source\task-go2-lidar-maze\source\go2_lidar_maze
+# from f:\isaacLab. That package publishes the isaaclab.tasks entry point.
+
+[project]
+name = "task-go2-lidar-maze"
+version = "0.1.0"
+description = "External Isaac Lab project: Unitree Go2 hierarchical LiDAR maze navigation."
+requires-python = ">=3.11"

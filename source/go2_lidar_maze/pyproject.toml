@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go2_lidar_maze"
+version = "0.1.0"
+description = "Hierarchical LiDAR maze navigation for the Unitree Go2."
+authors = [{ name = "Nepher Robotics" }]
+license = "BSD-3-Clause"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."isaaclab.tasks"]
+go2_lidar_maze = "go2_lidar_maze.tasks"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["go2_lidar_maze*"]
+
+[tool.setuptools.package-data]
+go2_lidar_maze = ["assets/maze/*", "assets/policies/*"]
