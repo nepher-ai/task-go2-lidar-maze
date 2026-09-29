@@ -3,10 +3,26 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from typing import Literal
+
 from isaaclab.utils import configclass
+
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlRNNModelCfg
 
 from go2_lidar_maze.paths import project_root
+
+
+@configclass
+class _CappedGaussianCfg(RslRlMLPModelCfg.GaussianDistributionCfg):
+    """Log-std Gaussian clamped to ``[0.05, 0.4]``.
+
+    ``rsl_rl`` forwards every field except ``class_name`` to
+    ``GaussianDistribution``. ``std_range`` is that constructor's clamp, in the
+    same units as ``init_std``.
+    """
+
+    std_type: Literal["scalar", "log"] = "log"
+    std_range: tuple[float, float] = (0.05, 0.4)
 
 
 @configclass
@@ -26,7 +42,7 @@ class Go2MazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         rnn_type="lstm",
         rnn_hidden_dim=256,
         rnn_num_layers=1,
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.5),
+        distribution_cfg=_CappedGaussianCfg(init_std=0.3),
     )
     critic = RslRlRNNModelCfg(
         hidden_dims=[256, 128],
@@ -38,9 +54,9 @@ class Go2MazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
-        use_clipped_value_loss=True,
+        use_clipped_value_loss=False,
         clip_param=0.2,
-        entropy_coef=0.001,
+        entropy_coef=0.0,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,

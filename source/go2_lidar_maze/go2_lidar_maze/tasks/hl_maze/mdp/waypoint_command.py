@@ -5,9 +5,11 @@
 
 """One body-frame waypoint, issued from a privileged path or from the online planner.
 
-The policy only observes the waypoint. The smoothed A* path is kept for the
-training reward. A waypoint is held until the robot is within the reach radius,
-then the next one is issued without resetting the episode.
+The policy observes the waypoint and a few points further along the path. The
+smoothed A* path is kept for the training reward and for those points. A
+privileged episode ends when the robot enters the reach radius; the reset then
+draws a new pose and a new waypoint. Online play holds the waypoint until the
+radius, then issues the next one without resetting.
 """
 
 from __future__ import annotations
@@ -16,9 +18,9 @@ from collections.abc import Sequence
 
 import torch
 
-from isaaclab.managers import CommandTerm
+from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
-from isaaclab.managers import CommandTermCfg
+from isaaclab.utils.math import quat_apply_inverse
 
 from go2_lidar_maze.constants import (
     CELL_CENTER_ORIGIN_M,
@@ -28,10 +30,34 @@ from go2_lidar_maze.constants import (
     REACH_RADIUS_M,
     SPAWN_JITTER_M,
 )
-from go2_lidar_maze.nav_core.path_utils import fillet_polyline, resample_polyline
+from go2_lidar_maze.nav_core.path_utils import cumulative_length, fillet_polyline, point_at_distance, resample_polyline
 from go2_lidar_maze.nav_core.stack import NavigationStack
+from go2_lidar_maze.tasks.hl_maze.lidar_frame import ray_origin_w
 
 _MAX_POINTS = 64
+# Online paths run from the robot to the maze goal. Keeping only the first 15 m
+# leaves the 12.5 m waypoint and the 4 m look-ahead on a 0.5 m sample grid.
+_ONLINE_PREFIX_M = 15.0
+# Base-frame box around this robot [m]. The trunk visual is x [-0.128, 0.332],
+# y ±0.097, z [-0.097, 0.089]; the box also covers the hips and the feet.
+# Returns inside it are the body, not a maze wall.
+_SELF_HIT_MIN = (-0.20, -0.17, -0.50)
+_SELF_HIT_MAX = (0.36, 0.17, 0.095)
+
+
+def _without_self_hits(hits: torch.Tensor, root_pos_w: torch.Tensor, root_quat_w: torch.Tensor) -> torch.Tensor:
+    """Copy of ``hits`` with returns on this robot replaced by infinity.
+
+    ``hits`` is ``(N, B, 3)`` [m]. The root pose is the base link. A point inside
+    ``_SELF_HIT_MIN`` / ``_SELF_HIT_MAX`` in that frame is the body or a leg, so the
+    occupancy grid must not mark it as a wall.
+    """
+    quat = root_quat_w.unsqueeze(1).expand(-1, hits.shape[1], -1)
+    local = quat_apply_inverse(quat, hits - root_pos_w.unsqueeze(1))
+    low = torch.tensor(_SELF_HIT_MIN, device=hits.device, dtype=hits.dtype)
+    high = torch.tensor(_SELF_HIT_MAX, device=hits.device, dtype=hits.dtype)
+    inside = torch.isfinite(local).all(dim=-1) & (local >= low).all(dim=-1) & (local <= high).all(dim=-1)
+    return hits.masked_fill(inside.unsqueeze(-1), float("inf"))
 
 
 class WaypointCommand(CommandTerm):
@@ -53,6 +79,13 @@ class WaypointCommand(CommandTerm):
         self.cross_track = torch.zeros(self.num_envs, device=self.device)
         self.reached_count = torch.zeros(self.num_envs, device=self.device)
         self.issued_count = torch.zeros(self.num_envs, device=self.device)
+        self.k_issued = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Outcome of the episode that just ended. Written before the resample
+        # clears the counters, so an evaluator can read it after ``step``.
+        self.last_k = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.last_reached = torch.zeros(self.num_envs, device=self.device)
+        self.last_collision = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.last_timeout = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.k_max = 1
         self._layout = None
         self._stack: NavigationStack | None = None
@@ -89,6 +122,7 @@ class WaypointCommand(CommandTerm):
 
     def _resample_command(self, env_ids: Sequence[int]):
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
+        self._remember_outcome(ids)
         self.reached_count[ids] = 0.0
         self.issued_count[ids] = 0.0
         if self._stack is not None:
@@ -98,8 +132,10 @@ class WaypointCommand(CommandTerm):
 
     def _update_command(self):
         self.time_on_waypoint += self._env.step_dt
-        if self.cfg.source == "online":
-            self._update_online()
+        if self.cfg.source != "online":
+            # Privileged arrival is a termination. The reset samples the next waypoint.
+            return
+        self._update_online()
         reached = self.distance_to_waypoint() < REACH_RADIUS_M
         newly = reached & ~self.bonus_paid
         self.reached_count += newly.float()
@@ -115,7 +151,12 @@ class WaypointCommand(CommandTerm):
 
     def _update_online(self):
         sensor = self._env.scene.sensors["lidar"]
-        self._stack.update(sensor.data.ray_hits_w.torch, sensor.data.pos_w.torch)
+        hits = _without_self_hits(
+            sensor.data.ray_hits_w.torch,
+            self.robot.data.root_pos_w.torch,
+            self.robot.data.root_quat_w.torch,
+        )
+        self._stack.update(hits, ray_origin_w(sensor))
         robot_xy = self.robot.data.root_pos_w.torch[:, :2]
         for index in range(self.num_envs):
             if bool(self.bonus_paid[index]):
@@ -134,8 +175,7 @@ class WaypointCommand(CommandTerm):
         waypoint, path, _length = self._stack.plan_waypoint(index, robot_xy, force=False)
         moved = float(torch.linalg.norm(waypoint - self.waypoint_w[index])) > 0.25
         self.waypoint_w[index] = waypoint
-        stored = resample_polyline(path, spacing=0.5, max_points=_MAX_POINTS)
-        self._write_path(index, stored)
+        self._write_online_path(index, path)
         goal_dist = torch.linalg.norm(waypoint - self._env.goal_xy[index])
         self.is_final[index] = bool(goal_dist < 0.3)
         if moved:
@@ -149,6 +189,7 @@ class WaypointCommand(CommandTerm):
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
         if ids.numel() == 0:
             return
+        self.k_issued[ids] = 0
         if self.cfg.source == "privileged":
             self._issue_privileged(ids)
         else:
@@ -165,7 +206,9 @@ class WaypointCommand(CommandTerm):
         robot_xy = self.robot.data.root_pos_w.torch[:, :2]
         for index in ids.tolist():
             start = _nearest_cell(robot_xy[index])
-            target, path = _sample_pair(layout, start, self.k_max, int(torch.randint(0, 10_000, (1,)).item()))
+            choice = int(torch.randint(0, 10_000, (1,)).item())
+            _, path, length_k = _sample_pair(layout, start, self.k_max, choice, self.cfg.frontier_fraction)
+            self.k_issued[index] = length_k
             cells_xy = [_cell_xy(cell) for cell in path]
             points = torch.tensor([robot_xy[index].tolist(), *cells_xy[1:]], device=self.device, dtype=torch.float32)
             jitter = (torch.rand(2, device=self.device) - 0.5) * (2.0 * SPAWN_JITTER_M)
@@ -178,8 +221,7 @@ class WaypointCommand(CommandTerm):
         for index in ids.tolist():
             waypoint, path, _length = self._stack.plan_waypoint(index, robot_xy[index], force=True)
             self.waypoint_w[index] = waypoint
-            stored = resample_polyline(path, spacing=0.5, max_points=_MAX_POINTS)
-            self._write_path(index, stored)
+            self._write_online_path(index, path)
             goal_dist = torch.linalg.norm(waypoint - goal_xy[index])
             self.is_final[index] = bool(goal_dist < 0.3)
 
@@ -198,6 +240,21 @@ class WaypointCommand(CommandTerm):
             self.path_xy[index, count:] = stored[-1]
         self.path_length[index] = torch.linalg.norm(stored[1:] - stored[:-1], dim=-1).sum()
 
+    def _remember_outcome(self, ids: torch.Tensor) -> None:
+        """Copy the ending state before this resample clears it."""
+        self.last_k[ids] = self.k_issued[ids]
+        self.last_reached[ids] = self.reached_count[ids]
+        terms = self._env.termination_manager
+        self.last_collision[ids] = terms.get_term("collision")[ids]
+        timed_out = terms.get_term("time_out")[ids] | terms.get_term("waypoint_timeout")[ids]
+        self.last_timeout[ids] = timed_out
+
+    def _write_online_path(self, index: int, path: torch.Tensor) -> None:
+        """Resample the first 15 m. A full maze path is too long for 64 points."""
+        prefix = _prefix_polyline(path, _ONLINE_PREFIX_M)
+        stored = resample_polyline(prefix, spacing=0.5, max_points=_MAX_POINTS)
+        self._write_path(index, stored)
+
     def _layout_or_build(self):
         if self._layout is None:
             from go2_lidar_maze.tasks.hl_maze.maze_layout import MazeLayout
@@ -214,6 +271,14 @@ class WaypointCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     source: str = "privileged"
     """``privileged`` during training, ``online`` at deployment."""
+    frontier_fraction: float = 0.5
+    """Probability of drawing an A* length of ``k_max``.
+
+    The remaining probability is spread uniformly over lengths ``1`` to
+    ``k_max - 1``. At ``k_max = 1`` every waypoint is one cell, and at
+    ``k_max = 5`` half of the waypoints are the five-cell length used at
+    deployment.
+    """
     maze_usd: str = ""
     """Wall USD used to build the privileged graph. Ignored when ``source`` is online."""
     resampling_time_range: tuple[float, float] = (1.0e6, 1.0e6)
@@ -241,13 +306,44 @@ def _cell_xy(index: int) -> tuple[float, float]:
     )
 
 
-def _sample_pair(layout, start: int, k_max: int, choice: int):
-    """Sample an A* length in ``[1, k_max]`` that this cell can actually reach."""
-    order = list(range(1, k_max + 1))
-    # Rotate the preference so ``choice`` picks the distance, then fall back.
-    shift = choice % len(order)
-    order = order[shift:] + order[:shift]
+def _sample_pair(layout, start: int, k_max: int, choice: int, frontier_fraction: float = 0.5):
+    """Sample an A* length in ``[1, k_max]`` that this cell can actually reach.
+
+    ``k_max`` is tried first with probability ``frontier_fraction``. Otherwise
+    a shorter length is tried first. A length the cell cannot reach falls
+    through to the next candidate.
+
+    Returns:
+        ``(target, path, k)`` with ``k`` the length that was issued.
+    """
+    if k_max <= 1:
+        order = [1]
+    else:
+        shorter = list(range(1, k_max))
+        shift = choice % len(shorter)
+        shorter = shorter[shift:] + shorter[:shift]
+        draw = (choice % 10_000) / 10_000.0
+        if draw < frontier_fraction:
+            order = [k_max, *shorter]
+        else:
+            order = [*shorter, k_max]
     for k in order:
         if layout.has_distance(start, k):
-            return layout.sample(start, k, choice)
+            target, path = layout.sample(start, k, choice)
+            return target, path, k
     raise RuntimeError(f"Cell {start} has no neighbour within {k_max} cells. The maze graph is disconnected.")
+
+
+def _prefix_polyline(points: torch.Tensor, max_length_m: float) -> torch.Tensor:
+    """Return the start of ``points``, cut at ``max_length_m`` [m]."""
+    cum = cumulative_length(points)
+    if float(cum[-1]) <= max_length_m:
+        return points
+    limit = torch.tensor(max_length_m, device=points.device, dtype=points.dtype)
+    end = point_at_distance(points, limit)
+    idx = int((cum < limit).sum().item())
+    idx = min(max(idx, 1), points.shape[0])
+    kept = points[:idx]
+    if float(torch.linalg.norm(kept[-1] - end)) < 1e-4:
+        return kept
+    return torch.cat((kept, end.unsqueeze(0)), dim=0)

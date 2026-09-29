@@ -31,6 +31,44 @@ def cumulative_length(points: torch.Tensor) -> torch.Tensor:
     return torch.cat((zero, torch.cumsum(seg, dim=-1)), dim=-1)
 
 
+def points_at_arc_length(points: torch.Tensor, distance: torch.Tensor) -> torch.Tensor:
+    """Point at an arc length on each polyline.
+
+    A repeated tail does not add length, so padding the buffer with the last
+    vertex does not create a second point.
+
+    Args:
+        points: Polylines ``(N, K, 2)`` [m].
+        distance: Arc length from the first vertex, ``(N,)`` or ``(N, M)`` [m].
+            Clamped to ``[0, length]``.
+
+    Returns:
+        Points ``(N, 2)`` when ``distance`` is ``(N,)``, otherwise ``(N, M, 2)`` [m].
+    """
+    single = distance.ndim == 1
+    if single:
+        distance = distance.unsqueeze(1)
+    cum = cumulative_length(points)
+    total = cum[:, -1:]
+    target = torch.minimum(distance.clamp(min=0.0), total)
+    # Count of vertices strictly before the target: the segment that contains it.
+    idx = (cum.unsqueeze(1) < target.unsqueeze(2)).sum(dim=-1)
+    idx = idx.clamp(min=1, max=points.shape[1] - 1)
+    prev = idx - 1
+    cum_hi = cum.gather(1, idx)
+    cum_lo = cum.gather(1, prev)
+    span = (cum_hi - cum_lo).clamp(min=1e-8)
+    frac = ((target - cum_lo) / span).clamp(0.0, 1.0).unsqueeze(-1)
+    gather_idx = idx.unsqueeze(-1).expand(-1, -1, points.shape[-1])
+    gather_prev = prev.unsqueeze(-1).expand(-1, -1, points.shape[-1])
+    pt_hi = points.gather(1, gather_idx)
+    pt_lo = points.gather(1, gather_prev)
+    out = pt_lo + frac * (pt_hi - pt_lo)
+    if single:
+        return out.squeeze(1)
+    return out
+
+
 def point_at_distance(points: torch.Tensor, distance: float | torch.Tensor) -> torch.Tensor:
     """Point at an arc length along a polyline.
 
@@ -100,7 +138,7 @@ def fillet_polyline(points: torch.Tensor, radius: float, samples: int = 5) -> to
         start = corner - d_in * tangent
         end = corner + d_out * tangent
         # Arc centre lies along the angle bisector, on the inside of the turn.
-        bisector = (-d_in + d_out)
+        bisector = -d_in + d_out
         bis_norm = torch.linalg.norm(bisector)
         if float(bis_norm) < 1e-6:
             out.append(corner)

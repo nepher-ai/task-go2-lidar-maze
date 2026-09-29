@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from isaaclab_physx.physics import PhysxCfg
+
+import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -26,9 +29,6 @@ from isaaclab.sensors.ray_caster.patterns import patterns_cfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab_physx.physics import PhysxCfg
-
-import isaaclab.envs.mdp as mdp
 
 from go2_lidar_maze.constants import collision_penalty
 from go2_lidar_maze.paths import ll_policy_path
@@ -43,7 +43,6 @@ _PACKAGE = Path(__file__).resolve().parents[2]
 _MAZE_USD = str(_PACKAGE / "assets" / "maze" / "enclosed_20x20.usd")
 _MAZE_TXT = _PACKAGE / "assets" / "maze" / "enclosed_20x20.txt"
 _POLICY = str(ll_policy_path())
-
 
 
 @configclass
@@ -69,16 +68,36 @@ class MazeSceneCfg(InteractiveSceneCfg):
     )
     robot = GO2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     lidar = MultiMeshRayCasterCfg(
+        # Base frame, +X forward. The head joint is at x = 0.285 m and the shell
+        # tops out at z = 0.089 m. This sits past the trunk, above the head.
         prim_path="{ENV_REGEX_NS}/Robot/base",
-        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.15)),
-        update_period=0.1,
+        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.36, 0.0, 0.23)),
+        # Refresh whenever the scan is read. A 0.1 s period equals one control step, but the
+        # viewport draws before that period elapses, and float32 time skips the refresh on
+        # some steps. The drawn scan then alternates between the current pose and the last one.
+        update_period=0.0,
         max_distance=10.0,
-        ray_alignment="yaw",
+        # "base" rotates the ring with the full link pose.
+        ray_alignment="base",
         mesh_prim_paths=[
             MultiMeshRayCasterCfg.RaycastTargetCfg(
                 prim_expr="/World/Maze",
                 track_mesh_transforms=False,
                 is_shared=True,
+            ),
+            # Static plane. Without it a downward beam is drawn out to max_distance through the floor.
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="/World/ground/terrain",
+                track_mesh_transforms=False,
+                is_shared=True,
+            ),
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/Robot/base/visuals",
+                track_mesh_transforms=True,
+            ),
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr="{ENV_REGEX_NS}/Robot/[FR][LR]_(hip|thigh|calf|foot)/visuals",
+                track_mesh_transforms=True,
             ),
         ],
         pattern_cfg=patterns_cfg.LidarPatternCfg(
@@ -134,7 +153,7 @@ class HlCommandsCfg:
 
 @configclass
 class HlObservationsCfg:
-    """191 actor values. The critic adds the remaining path length."""
+    """199 actor values. The critic adds the remaining path length."""
 
     @configclass
     class PolicyCfg(ObsGroup):
@@ -143,6 +162,7 @@ class HlObservationsCfg:
             params={"sensor_cfg": SceneEntityCfg("lidar"), "min_range": 0.1, "max_range": 10.0, "corrupt": True},
         )
         waypoint = ObsTerm(func=hl_mdp.observations.waypoint_b, params={"command_name": "waypoint"})
+        lookahead = ObsTerm(func=hl_mdp.observations.path_lookahead, params={"command_name": "waypoint"})
         lin_vel = ObsTerm(func=hl_mdp.observations.base_lin_vel_xy, params={"asset_cfg": SceneEntityCfg("robot")})
         yaw_rate = ObsTerm(func=hl_mdp.observations.base_yaw_rate, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=mdp.projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
@@ -159,6 +179,7 @@ class HlObservationsCfg:
             params={"sensor_cfg": SceneEntityCfg("lidar"), "min_range": 0.1, "max_range": 10.0, "corrupt": False},
         )
         waypoint = ObsTerm(func=hl_mdp.observations.waypoint_b, params={"command_name": "waypoint"})
+        lookahead = ObsTerm(func=hl_mdp.observations.path_lookahead, params={"command_name": "waypoint"})
         lin_vel = ObsTerm(func=hl_mdp.observations.base_lin_vel_xy, params={"asset_cfg": SceneEntityCfg("robot")})
         yaw_rate = ObsTerm(func=hl_mdp.observations.base_yaw_rate, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=mdp.projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
@@ -228,6 +249,11 @@ class HlTerminationsCfg:
         func=mdp.bad_orientation,
         params={"limit_angle": 1.0, "asset_cfg": SceneEntityCfg("robot")},
     )
+    waypoint_reached = DoneTerm(
+        func=hl_mdp.terminations.waypoint_reached,
+        params={"command_name": "waypoint"},
+        time_out=False,
+    )
     collision = DoneTerm(
         func=mdp.illegal_contact,
         params={
@@ -269,12 +295,19 @@ class Go2MazeEnvCfg(ManagerBasedRLEnvCfg):
     fixed_spawn: bool = False
     start_xy: tuple[float, float] = (0.0, 0.0)
     goal_xy: tuple[float, float] = (0.0, 0.0)
+    # Every robot, and only while a window is open. Each one is independent:
+    # ``env.vis_lidar_beams=true env.vis_lidar_hits=true env.vis_start_goal=true``.
+    vis_lidar_beams: bool = False
+    vis_lidar_hits: bool = False
+    vis_start_goal: bool = False
 
     def __post_init__(self):
         # C = 1.25 * p_max / (1 - gamma). Recomputed here so it tracks the weights.
         self.rewards.failure.weight = -collision_penalty()
         self.decimation = 20
-        self.episode_length_s = 60.0
+        # The per-waypoint budget is clip(L / 0.5 + 5, 10, 30) s. A 10 s cap
+        # would end a 4- or 5-cell waypoint before that budget.
+        self.episode_length_s = 30.0
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material

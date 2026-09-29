@@ -26,7 +26,6 @@ from go2_lidar_maze.constants import (
     BRAKE_WEIGHT,
     CLEARANCE_SAFE_M,
     CLEARANCE_WEIGHT,
-    FOOTPRINT_A_M,
     FOOTPRINT_B_M,
     LATERAL_REF_M,
     LATERAL_WEIGHT,
@@ -37,6 +36,7 @@ from go2_lidar_maze.constants import (
     WAYPOINT_BONUS,
 )
 from go2_lidar_maze.nav_core.path_utils import high_water, project_batch
+from go2_lidar_maze.tasks.hl_maze.lidar_frame import footprint_exit, ray_origin_w
 
 
 def _scale(env, value: torch.Tensor) -> torch.Tensor:
@@ -106,8 +106,14 @@ def waypoint_bonus(env, command_name: str) -> torch.Tensor:
 
 
 def failure(env) -> torch.Tensor:
-    """One-shot penalty on a real termination (collision or fall), not a timeout."""
-    return env.termination_manager.terminated.float() / env.step_dt
+    """One-shot penalty on a collision or a fall.
+
+    Reaching the waypoint is also a non-timeout termination, so this does not
+    read ``terminated``. A success must not pay ``C``.
+    """
+    collision = env.termination_manager.get_term("collision")
+    fallen = env.termination_manager.get_term("bad_orientation")
+    return (collision | fallen).float() / env.step_dt
 
 
 def _v_safe_tensor(clearance: torch.Tensor) -> torch.Tensor:
@@ -116,49 +122,59 @@ def _v_safe_tensor(clearance: torch.Tensor) -> torch.Tensor:
     return BRAKE_DECEL_MPS2 * (-BRAKE_LATENCY_S + torch.sqrt(inside))
 
 
-def _beam_clearance(ranges: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
-    """Clearance beyond the rectangular footprint along each beam [m]."""
-    cos_t = torch.cos(angles).abs().clamp(min=1e-4)
-    sin_t = torch.sin(angles).abs().clamp(min=1e-4)
-    rho = torch.minimum(FOOTPRINT_A_M / cos_t, FOOTPRINT_B_M / sin_t)
-    return ranges - rho
+def _beam_clearance(ranges: torch.Tensor, angles: torch.Tensor, sensor_xy: torch.Tensor) -> torch.Tensor:
+    """Clearance [m] beyond the footprint, measured from the ray origin."""
+    return ranges - footprint_exit(sensor_xy, angles)
 
 
-def _ranges(env, sensor_cfg: SceneEntityCfg, max_range: float) -> tuple[torch.Tensor, torch.Tensor]:
+def _ranges(
+    env, sensor_cfg: SceneEntityCfg, max_range: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Planar range and azimuth from the ray origin, and that origin in the yaw frame.
+
+    Returns:
+        Range [m], azimuth [rad], and the ray origin in the yaw frame [m].
+        Shapes are (N, B), (N, B), and (N, 2).
+    """
     sensor = env.scene.sensors[sensor_cfg.name]
+    robot = env.scene["robot"]
     hits = sensor.data.ray_hits_w.torch
-    origin = sensor.data.pos_w.torch
-    # Body-frame ray direction from the yaw-aligned sensor.
-    yaw = _yaw(env.scene["robot"].data.root_quat_w.torch)
+    origin = ray_origin_w(sensor)
+    yaw = _yaw(robot.data.root_quat_w.torch)
+    root_xy = robot.data.root_pos_w.torch[:, :2]
+    rel = origin[:, :2] - root_xy
+    cos_y = torch.cos(yaw)
+    sin_y = torch.sin(yaw)
+    sensor_xy = torch.stack((cos_y * rel[:, 0] + sin_y * rel[:, 1], -sin_y * rel[:, 0] + cos_y * rel[:, 1]), dim=-1)
     delta = hits[..., :2] - origin[:, :2].unsqueeze(1)
     # A miss is NaN. Leaving it in the angle makes the whole clearance term NaN.
     finite = torch.isfinite(delta).all(dim=-1)
     delta = torch.where(finite.unsqueeze(-1), delta, torch.zeros_like(delta))
-    cos_y = torch.cos(yaw).unsqueeze(1)
-    sin_y = torch.sin(yaw).unsqueeze(1)
-    bx = cos_y * delta[..., 0] + sin_y * delta[..., 1]
-    by = -sin_y * delta[..., 0] + cos_y * delta[..., 1]
+    cos_b = cos_y.unsqueeze(1)
+    sin_b = sin_y.unsqueeze(1)
+    bx = cos_b * delta[..., 0] + sin_b * delta[..., 1]
+    by = -sin_b * delta[..., 0] + cos_b * delta[..., 1]
     ranges = torch.linalg.norm(torch.stack((bx, by), dim=-1), dim=-1)
     ranges = torch.where(finite, ranges, torch.full_like(ranges, max_range))
     ranges = ranges.clamp(max=max_range)
     angles = torch.atan2(by, bx)
-    return ranges, angles
+    return ranges, angles, sensor_xy
 
 
 def _min_clearance(env, sensor_cfg: SceneEntityCfg, max_range: float) -> torch.Tensor:
-    ranges, angles = _ranges(env, sensor_cfg, max_range)
-    return _beam_clearance(ranges, angles).amin(dim=-1)
+    ranges, angles, sensor_xy = _ranges(env, sensor_cfg, max_range)
+    return _beam_clearance(ranges, angles, sensor_xy).amin(dim=-1)
 
 
 def _strip_clearance(env, sensor_cfg: SceneEntityCfg, heading: torch.Tensor, max_range: float) -> torch.Tensor:
     """Nearest clearance inside a strip of width ``2b`` around the velocity direction."""
-    ranges, angles = _ranges(env, sensor_cfg, max_range)
+    ranges, angles, sensor_xy = _ranges(env, sensor_cfg, max_range)
     # ``heading`` is the velocity direction in the body frame.
     delta = torch.atan2(torch.sin(angles - heading.unsqueeze(1)), torch.cos(angles - heading.unsqueeze(1)))
     lateral = ranges * torch.sin(delta).abs()
     in_strip = lateral <= FOOTPRINT_B_M
     ahead = delta.abs() < (math.pi / 2)
-    clearance = _beam_clearance(ranges, angles)
+    clearance = _beam_clearance(ranges, angles, sensor_xy)
     clearance = clearance.masked_fill(~(in_strip & ahead), max_range)
     return clearance.amin(dim=-1)
 

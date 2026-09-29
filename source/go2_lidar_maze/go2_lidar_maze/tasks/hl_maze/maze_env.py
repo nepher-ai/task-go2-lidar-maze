@@ -15,6 +15,8 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
+from go2_lidar_maze.tasks.hl_maze.episode_vis import attach_episode_vis
+from go2_lidar_maze.tasks.hl_maze.lidar_vis import attach_lidar_vis
 from go2_lidar_maze.tasks.hl_maze.mdp.events import enlarge_physx_aggregate_pairs
 from go2_lidar_maze.tasks.hl_maze.maze_env_cfg import Go2MazeEnvCfg
 
@@ -27,6 +29,8 @@ class Go2MazeEnv(ManagerBasedRLEnv):
         self.goal_xy[:, 0] = cfg.goal_xy[0]
         self.goal_xy[:, 1] = cfg.goal_xy[1]
         super().__init__(cfg, render_mode, **kwargs)
+        attach_lidar_vis(self)
+        attach_episode_vis(self)
 
     def _init_sim(self):
         """Write PhysX GPU capacities as ``UInt`` immediately before physics play."""
