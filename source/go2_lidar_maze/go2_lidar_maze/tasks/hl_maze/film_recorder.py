@@ -62,10 +62,11 @@ class MazeFilm:
         self._closed = False
         self._shot_index = -1
         self._skipped_blank = 0
+        self._grabber = _FabricCamera()
         vfov, hfov = _read_fov()
         tiles, self._env_ids = _tiles_from_env(env)
         seed = int(getattr(env.cfg, "seed", None) or 0)
-        tile_ids = choose_tiles(len(tiles), _TILES_PER_FILM, seed)
+        tile_ids = choose_tiles(tiles, _TILES_PER_FILM, seed)
         self._director = FilmDirector(tiles, tile_ids, vfov, hfov)
         env.sim.add_render_callback(_CALLBACK, self._on_render)
         physics = getattr(env.sim, "physics_manager", None)
@@ -89,6 +90,7 @@ class MazeFilm:
         if sim is not None and hasattr(sim, "remove_render_callback"):
             sim.remove_render_callback(_CALLBACK)
         self._close_writer()
+        self._grabber.close()
 
     def _on_render(self, _event) -> None:
         if self._closed or self._capturing or self._director is None or self._director.finished:
@@ -114,11 +116,10 @@ class MazeFilm:
         if pose is None:
             return
         viz.set_camera_view(pose.eye, pose.lookat)
-        # The visualizer may already have pumped this step with the previous
-        # pose. Force one more read so the saved frame matches the pose above.
-        if hasattr(viz, "_app_pumped_this_step"):
-            viz._app_pumped_this_step = False
-        frame = viz.render_rgb_array()
+        # Headless ``--video`` has no viewport. ``set_camera_view`` then only
+        # authors a USD xform, and the Kit frame grabber keeps returning the
+        # default perspective camera (one frozen view of the maze at the origin).
+        frame = self._grabber.grab(pose.eye, pose.lookat, viz)
         if frame is None or getattr(frame, "size", 0) == 0:
             return
         if int(frame.max()) == 0 and self._writer is None and self._skipped_blank < 30:
@@ -133,7 +134,9 @@ class MazeFilm:
         director.advance()
         if director.finished:
             self._close_writer()
+            self._grabber.close()
             print(f"[INFO] Maze film wrote {self._path}", flush=True)
+            _release_play_loop(self._env)
 
     def _append(self, frame) -> None:
         if self._writer is None:
@@ -157,6 +160,21 @@ class MazeFilm:
         self._writer = None
         if writer is not None:
             writer.close()
+
+
+def _release_play_loop(env) -> None:
+    """Stop ``play --video`` once the film file is closed.
+
+    That loop exits when a recorder length is reached, then closes the env.
+    Claiming ``--video`` removes those recorders, so the process would otherwise
+    wait on Ctrl+C after the mp4 exists.
+    """
+    from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
+
+    cfg = getattr(env, "cfg", None)
+    if cfg is None:
+        return
+    cfg.video_recorders = [VideoRecorderCfg(video_length=0, step_offset=0)]
 
 
 def _tiles_from_env(env) -> tuple[list[TileGeom], list[int]]:
@@ -188,6 +206,184 @@ def _robot_xy(env, env_ids: list[int]) -> dict[int, tuple[float, float]]:
         for tile, env_id in enumerate(env_ids)
         if env_id < pos.shape[0]
     }
+
+
+class _FabricCamera:
+    """RGB camera whose pose is written where the renderer actually reads it.
+
+    A headless Kit visualizer never creates a viewport, so viewport camera
+    commands do not move ``/OmniverseKit_Persp``. This camera is a stage prim
+    updated through Fabric, then rendered with one Kit frame.
+    """
+
+    _PATH = "/World/MazeFilmCamera"
+
+    def __init__(self) -> None:
+        self._annotator = None
+        self._product = None
+        self._translate_op = None
+        self._orient_op = None
+        self._width = 1280
+        self._height = 720
+
+    def grab(self, eye, lookat, viz) -> object | None:
+        import numpy as np
+        import omni.kit.app
+
+        from isaaclab.app.settings_manager import get_settings_manager
+
+        self._ensure(viz)
+        _write_camera_pose(self._PATH, self._translate_op, self._orient_op, eye, lookat)
+        import contextlib
+
+        if self._product is not None:
+            with contextlib.suppress(Exception):
+                self._product.resume()
+        settings = get_settings_manager()
+        play_flag = settings.get("/app/player/playSimulations")
+        settings.set_bool("/app/player/playSimulations", False)
+        try:
+            omni.kit.app.get_app().update()
+        finally:
+            if play_flag is not None:
+                settings.set_bool("/app/player/playSimulations", bool(play_flag))
+        raw = self._annotator.get_data()
+        if isinstance(raw, dict):
+            raw = raw.get("data")
+        if self._product is not None:
+            with contextlib.suppress(Exception):
+                self._product.pause()
+        raw = np.asarray(raw)
+        if raw.size == 0:
+            return None
+        if raw.ndim == 1:
+            raw = raw.reshape(self._height, self._width, -1)
+        return np.asarray(raw[:, :, :3], dtype=np.uint8)
+
+    def close(self) -> None:
+        import contextlib
+
+        if self._annotator is not None:
+            with contextlib.suppress(Exception):
+                self._annotator.detach()
+        if self._product is not None:
+            with contextlib.suppress(Exception):
+                self._product.destroy()
+        self._annotator = None
+        self._product = None
+
+    def _ensure(self, viz) -> None:
+        if self._annotator is not None:
+            return
+        import omni.kit.app
+        import omni.replicator.core as rep
+        import omni.usd
+        from pxr import UsdGeom
+
+        cfg = getattr(viz, "cfg", None)
+        self._width = int(getattr(cfg, "window_width", 1280) or 1280)
+        self._height = int(getattr(cfg, "window_height", 720) or 720)
+        stage = omni.usd.get_context().get_stage()
+        camera = UsdGeom.Camera.Define(stage, self._PATH)
+        xform = UsdGeom.Xformable(camera.GetPrim())
+        xform.ClearXformOpOrder()
+        # Eyes are world-space. Drop any parent transform so the authored pose is the world pose.
+        xform.SetResetXformStack(True)
+        prim = camera.GetPrim()
+        translate_attr = prim.GetAttribute("xformOp:translate")
+        self._translate_op = (
+            UsdGeom.XformOp(translate_attr)
+            if translate_attr
+            else xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+        )
+        orient_attr = prim.GetAttribute("xformOp:orient")
+        self._orient_op = (
+            UsdGeom.XformOp(orient_attr)
+            if orient_attr
+            else xform.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
+        )
+        xform.SetXformOpOrder([self._translate_op, self._orient_op], True)
+        _copy_lens(stage, camera)
+        # Publish the prim to Fabric before the render product binds to it.
+        from isaaclab.app.settings_manager import get_settings_manager
+
+        settings = get_settings_manager()
+        play_flag = settings.get("/app/player/playSimulations")
+        settings.set_bool("/app/player/playSimulations", False)
+        try:
+            omni.kit.app.get_app().update()
+        finally:
+            if play_flag is not None:
+                settings.set_bool("/app/player/playSimulations", bool(play_flag))
+        self._product = rep.create.render_product(self._PATH, (self._width, self._height))
+        self._annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+        self._annotator.attach([self._product])
+
+
+def _copy_lens(stage, camera) -> None:
+    """Match the perspective camera's field of view, which the shot math uses."""
+    from pxr import UsdGeom
+
+    source_prim = stage.GetPrimAtPath("/OmniverseKit_Persp")
+    if not source_prim or not source_prim.IsValid():
+        return
+    source = UsdGeom.Camera(source_prim)
+    for getter, setter in (
+        (source.GetFocalLengthAttr, camera.GetFocalLengthAttr),
+        (source.GetHorizontalApertureAttr, camera.GetHorizontalApertureAttr),
+        (source.GetVerticalApertureAttr, camera.GetVerticalApertureAttr),
+        (source.GetClippingRangeAttr, camera.GetClippingRangeAttr),
+    ):
+        value = getter().Get()
+        if value is not None:
+            setter().Set(value)
+
+
+def _write_camera_pose(prim_path: str, translate_op, orient_op, eye, lookat) -> None:
+    """Author a world-space look-at on the film camera.
+
+    Replicator's pose helper crashes here: with Fabric scene delegate off it
+    builds a USD transform and then feeds it a Fabric vector. The pose is
+    written as USD xform ops, then copied into Fabric so a scene delegate that
+    ignores later USD edits still moves.
+    """
+    import torch
+    import usdrt.Gf
+    import usdrt.Sdf
+    import usdrt.Usd
+    import usdrt.hierarchy
+    from pxr import Gf, UsdGeom
+
+    from isaaclab.utils.math import create_rotation_matrix_from_view, quat_from_matrix
+
+    import omni.usd
+
+    stage = omni.usd.get_context().get_stage()
+    eye_t = torch.tensor([[float(eye[0]), float(eye[1]), float(eye[2])]], dtype=torch.float32)
+    look_t = torch.tensor([[float(lookat[0]), float(lookat[1]), float(lookat[2])]], dtype=torch.float32)
+    up_axis = UsdGeom.GetStageUpAxis(stage) if stage is not None else "Z"
+    rotation = create_rotation_matrix_from_view(eye_t, look_t, up_axis=up_axis, device="cpu")
+    if torch.isnan(rotation).any():
+        raise ValueError("Maze film camera eye and look-at are degenerate.")
+    quat_xyzw = quat_from_matrix(rotation)[0]
+    quat = Gf.Quatd(
+        float(quat_xyzw[3]),
+        Gf.Vec3d(float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2])),
+    )
+    translation = Gf.Vec3d(float(eye[0]), float(eye[1]), float(eye[2]))
+    translate_op.Set(translation)
+    orient_op.Set(quat)
+
+    transform = Gf.Transform()
+    transform.SetTranslation(translation)
+    transform.SetRotation(Gf.Rotation(quat))
+    matrix = transform.GetMatrix()
+    fabric_matrix = usdrt.Gf.Matrix4d(*[float(matrix[row][col]) for row in range(4) for col in range(4)])
+    rt_stage = usdrt.Usd.Stage.Attach(omni.usd.get_context().get_stage_id())
+    hierarchy = usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
+        rt_stage.GetFabricId(), rt_stage.GetStageIdAsStageId()
+    )
+    hierarchy.set_local_xform(usdrt.Sdf.Path(prim_path), fabric_matrix)
 
 
 def _capture_visualizer(env):

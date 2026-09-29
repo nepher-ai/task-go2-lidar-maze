@@ -102,6 +102,24 @@ def test_layout_places_spawns_on_the_derived_grid():
     assert math.isnan(float(layout.optimal_route_m[1]))
 
 
+def test_ground_plane_covers_every_tile():
+    """The visual plane has to reach the far corner, not stop at the origin tile."""
+    layout = _layout_module().layout_from_scenario(_scenario())
+    center_x, center_y, size_x, size_y = _layout_module().ground_plane_cover(
+        layout.tile_origin_xy, layout.grid_n, layout.cell_pitch, margin_m=0.0
+    )
+    # 8 * 3.5 + 0.5 = 28.5 on the origin tile; the next tile ends at 40 + 8 * 2.5 + 0.5.
+    assert abs(size_x - 60.5) < 1e-4
+    assert abs(size_y - 28.5) < 1e-4
+    assert abs(center_x - 30.25) < 1e-4
+    assert abs(center_y - 14.25) < 1e-4
+    repeated = _layout_module().layout_from_scenario(_scenario()).for_envs(3)
+    again = _layout_module().ground_plane_cover(
+        repeated.tile_origin_xy, repeated.grid_n, repeated.cell_pitch, margin_m=0.0
+    )
+    assert again == (center_x, center_y, size_x, size_y)
+
+
 def test_for_envs_repeats_tiles():
     layout = _layout_module().layout_from_scenario(_scenario()).for_envs(3)
     assert layout.num_tiles == 3

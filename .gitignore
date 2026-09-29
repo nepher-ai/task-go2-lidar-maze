@@ -20,3 +20,9 @@ Thumbs.db
 /logs/
 /best_policy/**/*.pt
 /best_policy/**/*.onnx
+/exported/
+/best_policy/**/*.data
+
+# Videos
+/videos/
+*.mp4

@@ -54,7 +54,7 @@ Each of those drawings has its own switch, and each defaults to off. Append any 
 .\isaaclab.bat play --task Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0 --video --num_envs 60
 ```
 
-`--video` on the benchmark play task does not use the stock one-frame-per-step recorder. The high-level policy still runs at 10 Hz. The viewport is drawn on every low-level tick and the mp4 is encoded at 50 fps, so playback matches robot time. The camera starts about 10 degrees off vertical. It holds a view of every maze for 4 s, then visits four mazes chosen from the environment seed: 2 s to move in, 4 s with that maze filling the frame top to bottom, 20 s a little lower following that maze's robot, then on to the next. The mp4 is written under the loaded checkpoint's `videos/play/` directory. Do not combine this with `--viz none`.
+`--video` on the benchmark play task does not use the stock one-frame-per-step recorder. The high-level policy still runs at 10 Hz. The viewport is drawn on every low-level tick and the mp4 is encoded at 50 fps, so playback matches robot time. The camera starts about 10 degrees off vertical. It holds a view of every maze for 4 s, then visits four mazes from the environment seed. The first maze is anywhere in the field. Each later maze is a random neighbor of the one just shown, one of the eight cells around it. The camera eases between those poses: 2 s to move in, 4 s from higher up so that whole maze is in frame, 2 s to lower onto its robot, then 20 s following it from the lower height. The mp4 is written under the loaded checkpoint's `videos/play/` directory, and play exits once that file is closed. Do not combine this with `--viz none`.
 
 ## Evaluate on go2-maze-v0
 

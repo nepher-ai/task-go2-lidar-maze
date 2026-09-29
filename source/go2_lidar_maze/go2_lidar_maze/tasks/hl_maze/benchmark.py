@@ -61,6 +61,42 @@ class BenchmarkLayout:
         )
 
 
+def ground_plane_cover(
+    tile_origin_xy: torch.Tensor,
+    grid_n: torch.Tensor,
+    cell_pitch: torch.Tensor,
+    *,
+    wall_m: float = _DEFAULT_WALL_M,
+    margin_m: float = 1.0,
+) -> tuple[float, float, float, float]:
+    """Center and size [m] of a rectangle that covers every tile.
+
+    Returns ``(center_x, center_y, size_x, size_y)``. Repeated tile origins are
+    covered once. ``margin_m`` is added on each side. A tile spans
+    ``n * cell_pitch + wall_m`` from its origin.
+    """
+    if tile_origin_xy.shape[0] == 0:
+        raise ValueError("No tiles to cover with the ground plane.")
+    seen: set[tuple[float, float]] = set()
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    for index in range(int(tile_origin_xy.shape[0])):
+        origin = (round(float(tile_origin_xy[index, 0]), 3), round(float(tile_origin_xy[index, 1]), 3))
+        if origin in seen:
+            continue
+        seen.add(origin)
+        span = float(grid_n[index]) * float(cell_pitch[index]) + wall_m
+        min_x = min(min_x, origin[0])
+        min_y = min(min_y, origin[1])
+        max_x = max(max_x, origin[0] + span)
+        max_y = max(max_y, origin[1] + span)
+    min_x -= margin_m
+    min_y -= margin_m
+    max_x += margin_m
+    max_y += margin_m
+    return ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, max_x - min_x, max_y - min_y)
+
+
 def load_benchmark(path: str | Path) -> BenchmarkLayout:
     """Load ``scenario.json`` and return one row per tile."""
     scenario_path = Path(path)

@@ -16,7 +16,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
 from go2_lidar_maze.constants import CELL_CENTER_ORIGIN_M, CELL_PITCH_M, GRID_SIZE
-from go2_lidar_maze.tasks.hl_maze.benchmark import load_benchmark
+from go2_lidar_maze.tasks.hl_maze.benchmark import ground_plane_cover, load_benchmark
 from go2_lidar_maze.tasks.hl_maze.episode_vis import attach_episode_vis
 from go2_lidar_maze.tasks.hl_maze.film_recorder import MazeFilm, claim_video
 from go2_lidar_maze.tasks.hl_maze.lidar_vis import attach_lidar_vis
@@ -39,6 +39,8 @@ class Go2MazeEnv(ManagerBasedRLEnv):
         film_target = claim_video(cfg)
         self._apply_benchmark(cfg)
         super().__init__(cfg, render_mode, **kwargs)
+        if self._scenario_spawn_xy is not None:
+            _fit_ground_to_tiles(self)
         attach_lidar_vis(self)
         attach_episode_vis(self)
         self._maze_film = MazeFilm(self, *film_target) if film_target is not None else None
@@ -90,3 +92,76 @@ class Go2MazeEnv(ManagerBasedRLEnv):
             super()._init_sim()
         finally:
             self.sim.reset = sim_reset  # type: ignore[method-assign]
+
+
+def _fit_ground_to_tiles(env: Go2MazeEnv) -> None:
+    """Stretch the visual ground plane across every benchmark tile.
+
+    The importer builds a 100 m plane centered on the origin. Tiles continue
+    well past that, so the rest of the field is drawn on the sky. The plane
+    stays on the origin: a translation here is scaled with the mesh and lands
+    beside the mazes, which removes the white ground from the shot.
+    """
+    center_x, center_y, span_x, span_y = ground_plane_cover(
+        env.tile_origin_xy.detach().cpu(),
+        env.maze_grid_n.detach().cpu(),
+        env.maze_cell_pitch.detach().cpu(),
+    )
+    size_x = 2.0 * max(abs(center_x - span_x * 0.5), abs(center_x + span_x * 0.5))
+    size_y = 2.0 * max(abs(center_y - span_y * 0.5), abs(center_y + span_y * 0.5))
+    import omni.usd
+    from pxr import UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath("/World/ground/terrain/Environment") if stage is not None else None
+    if prim is None or not prim.IsValid():
+        return
+    # The bundled plane asset is 100 m across at unit scale. Same attribute the spawner writes.
+    scale = prim.GetAttribute("xformOp:scale")
+    if not scale:
+        return
+    scale.Set((size_x / 100.0, size_y / 100.0, 1.0))
+    _rescale_ground_grid(stage, size_x, size_y)
+    _sync_ground_scale(prim)
+
+
+def _rescale_ground_grid(stage, size_x: float, size_y: float) -> None:
+    """Keep the 1 m grid metric after the plane mesh is scaled."""
+    from pxr import Gf, UsdGeom
+
+    mesh = UsdGeom.Mesh(stage.GetPrimAtPath("/World/ground/terrain/Environment/Geometry"))
+    if not mesh.GetPrim().IsValid():
+        return
+    # The plane texture repeats every 5 m.
+    half_u = size_x / 10.0
+    half_v = size_y / 10.0
+    primvar = UsdGeom.PrimvarsAPI(mesh).GetPrimvar("st")
+    if not primvar:
+        return
+    primvar.Set(
+        [
+            Gf.Vec2f(-half_u, -half_v),
+            Gf.Vec2f(half_u, -half_v),
+            Gf.Vec2f(half_u, half_v),
+            Gf.Vec2f(-half_u, half_v),
+        ]
+    )
+
+
+def _sync_ground_scale(prim) -> None:
+    """Publish the scaled plane into Fabric. The renderer does not reread the USD scale."""
+    import omni.usd
+    import usdrt.Gf
+    import usdrt.Sdf
+    import usdrt.Usd
+    import usdrt.hierarchy
+    from pxr import Usd, UsdGeom
+
+    local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
+    if isinstance(local, tuple):
+        local = local[0]
+    rt_stage = usdrt.Usd.Stage.Attach(omni.usd.get_context().get_stage_id())
+    hierarchy = usdrt.hierarchy.IFabricHierarchy().get_fabric_hierarchy(
+        rt_stage.GetFabricId(), rt_stage.GetStageIdAsStageId()
+    )
+    hierarchy.set_local_xform(usdrt.Sdf.Path(str(prim.GetPath())), usdrt.Gf.Matrix4d(local))
