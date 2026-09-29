@@ -18,3 +18,8 @@ def project_root() -> Path:
 def ll_policy_path() -> Path:
     """TorchScript velocity policy used by the high-level action term."""
     return project_root() / "best_policy" / "ll_policy" / "ll_policy.pt"
+
+
+def hl_policy_path() -> Path:
+    """Shipped high-level checkpoint for benchmark play."""
+    return project_root() / "best_policy" / "best_policy.pt"

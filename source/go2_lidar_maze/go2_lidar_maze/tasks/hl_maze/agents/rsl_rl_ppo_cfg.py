@@ -9,7 +9,7 @@ from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlRNNModelCfg
 
-from go2_lidar_maze.paths import project_root
+from go2_lidar_maze.paths import hl_policy_path, project_root
 
 
 @configclass
@@ -66,3 +66,10 @@ class Go2MazePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class Go2MazePPORunnerCfg_ENVHUB_PLAY(Go2MazePPORunnerCfg):
+    """Benchmark play loads the shipped checkpoint, not the newest training log."""
+
+    load_checkpoint = str(hl_policy_path())

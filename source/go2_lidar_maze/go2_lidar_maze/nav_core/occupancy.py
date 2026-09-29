@@ -91,13 +91,15 @@ class OccupancyGrid:
         return (self.free_counts > 0) & ~self.obstacle_mask()
 
     @torch.no_grad()
-    def update(self, ray_hits_w: torch.Tensor, sensor_pos_w: torch.Tensor, free_samples: int = 8) -> None:
+    def update(self, ray_hits_w: torch.Tensor, sensor_pos_w: torch.Tensor, free_samples: int | None = None) -> None:
         """Fold one scan into the grid.
 
         Args:
             ray_hits_w: Hit points ``(N, B, 3)`` [m]. Misses are non-finite.
             sensor_pos_w: Sensor origin ``(N, 3)`` [m].
             free_samples: Samples taken along each beam, short of the hit.
+                ``None`` picks a spacing no coarser than the cell size, capped
+                at 48, so a beam marks every free cell it crosses.
         """
         delta = ray_hits_w - sensor_pos_w.unsqueeze(1)
         dist = torch.linalg.norm(delta, dim=-1)
@@ -111,32 +113,43 @@ class OccupancyGrid:
         cells = self.world_to_cell(ray_hits_w[..., :2])
         flat = cells[..., 0] * self.size + cells[..., 1]
         sink = self.size * self.size
-        flat = torch.where(valid, flat, torch.full_like(flat, sink))
-        buf = torch.zeros((self.num_envs, sink + 1), dtype=torch.int32, device=self.device)
-        buf.scatter_add_(1, flat, torch.ones_like(flat, dtype=torch.int32))
-        self.counts += buf[:, :sink].view(self.num_envs, self.size, self.size)
+        self._index_add_cells(self.counts, flat, valid, sink)
         self.counts.clamp_(max=1000)
 
         finite = torch.isfinite(dist) & (dist > 0.05)
-        if not bool(finite.any()):
-            return
+        if free_samples is None:
+            # The finest cell the grid can use. Denser than a coarser env's cell is still correct.
+            free_samples = int(self.max_valid_range / max(self.base_res, 0.05))
+            free_samples = min(max(free_samples, 8), 48)
         d_safe = torch.where(finite, dist, torch.zeros_like(dist))
         free_len = (torch.minimum(d_safe, torch.full_like(d_safe, self.max_valid_range)) - 0.3).clamp(min=0.0)
-        direction = delta / d_safe.clamp(min=1e-6).unsqueeze(-1)
+        direction = delta[..., :2] / d_safe.clamp(min=1e-6).unsqueeze(-1)
         direction = torch.where(finite.unsqueeze(-1), direction, torch.zeros_like(direction))
-        for sample in range(1, free_samples + 1):
-            frac = sample / (free_samples + 1)
-            pt = sensor_pos_w.unsqueeze(1) + direction * (free_len * frac).unsqueeze(-1)
-            inside = finite & (free_len > 0.05) & self.in_bounds(pt[..., :2])
-            free_cells = self.world_to_cell(pt[..., :2])
-            free_flat = free_cells[..., 0] * self.size + free_cells[..., 1]
-            free_flat = torch.where(inside, free_flat, torch.full_like(free_flat, sink))
-            free_buf = torch.zeros((self.num_envs, sink + 1), dtype=torch.int32, device=self.device)
-            free_buf.scatter_add_(1, free_flat, torch.ones_like(free_flat, dtype=torch.int32))
-            self.free_counts += free_buf[:, :sink].view(self.num_envs, self.size, self.size).to(torch.int16)
+        fractions = torch.linspace(
+            1.0 / (free_samples + 1),
+            free_samples / (free_samples + 1),
+            free_samples,
+            device=self.device,
+        )
+        travel = (free_len.unsqueeze(-1) * fractions.view(1, 1, -1)).unsqueeze(-1)
+        pts = sensor_pos_w[:, :2].unsqueeze(1).unsqueeze(2) + direction.unsqueeze(2) * travel
+        flat_pts = pts.reshape(self.num_envs, -1, 2)
+        inside = (finite & (free_len > 0.05)).unsqueeze(-1).expand(-1, -1, free_samples)
+        inside = inside.reshape(self.num_envs, -1) & self.in_bounds(flat_pts)
+        free_cells = self.world_to_cell(flat_pts)
+        free_flat = free_cells[..., 0] * self.size + free_cells[..., 1]
+        self._index_add_cells(self.free_counts, free_flat, inside, sink)
         self.free_counts.clamp_(max=1000)
         # A cell that is both hit and traversed counts as a wall, not free.
         self.free_counts.masked_fill_(self.obstacle_mask(), 0)
+
+    def _index_add_cells(self, grid: torch.Tensor, flat: torch.Tensor, valid: torch.Tensor, sink: int) -> None:
+        """Add 1 to each valid flat cell. Invalid beams are left out, so no dense buffer is cleared."""
+        env_ids = torch.arange(self.num_envs, device=self.device)[:, None].expand_as(flat)
+        lin = env_ids * sink + flat
+        lin = lin[valid]
+        ones = torch.ones(lin.shape[0], dtype=grid.dtype, device=self.device)
+        grid.view(-1).index_add_(0, lin, ones)
 
     def _broadcast_res(self, ref: torch.Tensor) -> torch.Tensor:
         shape = [self.num_envs] + [1] * (ref.dim() - 1)

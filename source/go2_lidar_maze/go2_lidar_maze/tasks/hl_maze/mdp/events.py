@@ -13,6 +13,7 @@ import isaaclab.utils.math as math_utils
 from isaaclab.managers import SceneEntityCfg
 
 from go2_lidar_maze.constants import CELL_CENTER_ORIGIN_M, CELL_PITCH_M, GRID_SIZE, SPAWN_JITTER_M
+from go2_lidar_maze.tasks.hl_maze.cell_pairs import CorridorGraph
 
 
 def enlarge_physx_aggregate_pairs(env, env_ids=None) -> None:
@@ -51,11 +52,23 @@ def reset_go2_in_maze(
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> None:
-    """Place robots on corridor centres, with ±0.4 m jitter, or on the fixed start."""
+    """Place robots on corridor centres, with ±0.4 m jitter, or on the fixed start.
+
+    When ``sample_start_goal`` is set, each resetting environment draws a random
+    start cell and a different random goal cell, and keeps the pair only when
+    A* finds a path. The goal is that cell's centre [m]. The start is the
+    centre plus the usual ±0.4 m, and the yaw is uniform in [-π, π).
+    """
     robot = env.scene[asset_cfg.name]
     pose = robot.data.default_root_pose.torch[env_ids].clone()
     count = env_ids.shape[0]
-    if env.cfg.fixed_spawn:
+    if env.cfg.sample_start_goal:
+        start_xy, goal_xy = _corridor_graph(env).sample(count, robot.device)
+        jitter = (torch.rand(count, 2, device=robot.device) - 0.5) * (2.0 * SPAWN_JITTER_M)
+        xy = start_xy + jitter
+        yaw = (torch.rand(count, device=robot.device) - 0.5) * (2.0 * torch.pi)
+        env.goal_xy[env_ids] = goal_xy
+    elif env.cfg.fixed_spawn:
         xy = torch.tensor(env.cfg.start_xy, device=robot.device, dtype=torch.float32).expand(count, 2)
         yaw = torch.full((count,), 1.5708, device=robot.device)
     else:
@@ -79,3 +92,40 @@ def reset_go2_in_maze(
     velocity = torch.zeros(count, 6, device=robot.device)
     robot.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
     robot.write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=env_ids)
+
+
+def reset_go2_from_scenario(
+    env,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Place each robot on its scenario spawn. No jitter.
+
+    The goal stays the tile's recorded goal, so the online planner anchors
+    on the benchmark pair rather than a random cell.
+    """
+    robot = env.scene[asset_cfg.name]
+    pose = robot.data.default_root_pose.torch[env_ids].clone()
+    spawn_xy = env._scenario_spawn_xy[env_ids]
+    yaw = env._scenario_spawn_yaw[env_ids]
+    pose[:, 0] = spawn_xy[:, 0]
+    pose[:, 1] = spawn_xy[:, 1]
+    count = env_ids.shape[0]
+    zeros = torch.zeros(count, device=robot.device)
+    pose[:, 3:7] = math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
+    velocity = torch.zeros(count, 6, device=robot.device)
+    robot.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
+    robot.write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=env_ids)
+    env.goal_xy[env_ids] = env._scenario_goal_xy[env_ids]
+
+
+def _corridor_graph(env) -> CorridorGraph:
+    """Adjacency measured once from the wall mesh and reused on later resets."""
+    graph = getattr(env, "_corridor_graph", None)
+    if graph is None:
+        from go2_lidar_maze.tasks.hl_maze.maze_layout import adjacency_from_blocked, measure_blocked_pairs
+
+        blocked = measure_blocked_pairs(env.cfg.commands.waypoint.maze_usd)
+        graph = CorridorGraph(adjacency_from_blocked(blocked))
+        env._corridor_graph = graph
+    return graph

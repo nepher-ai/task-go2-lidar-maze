@@ -293,6 +293,10 @@ class Go2MazeEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: HlCurriculumCfg = HlCurriculumCfg()
 
     fixed_spawn: bool = False
+    sample_start_goal: bool = False
+    scenario_path: str = ""
+    """EnvHub ``scenario.json``. Empty keeps the single training maze."""
+    """Draw a new start cell and goal cell for each resetting environment."""
     start_xy: tuple[float, float] = (0.0, 0.0)
     goal_xy: tuple[float, float] = (0.0, 0.0)
     # Every robot, and only while a window is open. Each one is independent:
@@ -336,15 +340,67 @@ class Go2MazeEnvCfg_PLAY(Go2MazeEnvCfg):
 
 @configclass
 class Go2MazeEnvCfg_PLANNER(Go2MazeEnvCfg):
-    """Online LiDAR planner. Start and goal come from the maze text file, not its path."""
+    """Online LiDAR planner. Each reset draws a reachable start and goal per robot."""
 
     def __post_init__(self):
         super().__post_init__()
         start_x, start_y, end_x, end_y = load_start_goal(_MAZE_TXT)
         self.scene.num_envs = 1
-        self.fixed_spawn = True
+        self.fixed_spawn = False
+        self.sample_start_goal = True
+        # Placeholder until the first reset draws a pair per environment.
         self.start_xy = (start_x, start_y)
         self.goal_xy = (end_x, end_y)
         self.commands.waypoint.source = "online"
         self.curriculum.waypoint_distance = None
         self.episode_length_s = 180.0
+
+
+@configclass
+class Go2MazeEnvCfg_PLANNER_Envhub_PLAY(Go2MazeEnvCfg_PLANNER):
+    """Online planner on the ``go2-maze-v0`` benchmark. One robot per maze tile.
+
+    ``env_id`` and ``scene_id`` are injected by
+    ``eval_nav.managers.EnvironmentManager.build_env_cfg``.
+    """
+
+    env_id: str = "go2-maze-v0"
+    scene_id: str | int = 0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self._load_envhub()
+        self.scene.num_envs = 60
+        self.sample_start_goal = False
+        self.fixed_spawn = False
+        self.episode_length_s = 300.0
+        self.events.reset_robot = EventTerm(func=hl_mdp.events.reset_go2_from_scenario, mode="reset")
+        # Planner play does not read the wall-filtered contact matrix.
+        self.scene.contact_forces.filter_prim_paths_expr = []
+
+    def _load_envhub(self) -> None:
+        """Point the shared maze asset at the assembled benchmark world."""
+        if not self.env_id:
+            return
+
+        from nepher import load_env
+
+        env = load_env(self.env_id, category="navigation")
+        bundle_path = env.cache_path
+
+        scene_file = bundle_path / "maze_scene.py"
+        if scene_file.is_file():
+            import runpy
+
+            namespace = runpy.run_path(str(scene_file))
+            namespace["ensure_generated"](bundle_path)
+
+        world_usd = bundle_path / "maps" / "benchmark_world.usd"
+        scenario = bundle_path / "maps" / "scenario.json"
+        if not world_usd.is_file() or not scenario.is_file():
+            raise FileNotFoundError(
+                f"go2-maze-v0 bundle at '{bundle_path}' is missing "
+                "maps/benchmark_world.usd or maps/scenario.json."
+            )
+        self.scene.maze.spawn.usd_path = str(world_usd)
+        self.scenario_path = str(scenario)

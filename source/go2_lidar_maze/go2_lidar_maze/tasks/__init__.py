@@ -8,5 +8,6 @@
 from go2_lidar_maze.tasks.checkpoint import prefer_checkpoint_file
 
 from . import hl_maze, ll_velocity  # noqa: F401
+from .hl_maze.eval_compat import wrap_for_eval  # noqa: F401
 
 prefer_checkpoint_file()

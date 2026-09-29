@@ -6,9 +6,9 @@ Three pieces:
 
 - **Low-level policy.** Flat-ground velocity tracking. The command envelope is vx [-2, 3] m/s, vy [-1, 1] m/s, yaw rate [-2, 2] rad/s. Exported to TorchScript and then frozen.
 - **High-level policy.** A velocity command out. The inputs are one waypoint, four points on its path (1 m to 4 m ahead), and a 360° LiDAR scan. An LSTM actor-critic, because a waypoint up to five cells away can sit behind a corner the current scan cannot see.
-- **Planner.** At deployment the map starts empty. LiDAR hits fill an occupancy grid, A* plans to the goal, and the policy is given one waypoint on that path plus the next few metres of the path.
+- **Planner.** At deployment the map starts empty. LiDAR hits fill an occupancy grid. A doorway is an edge only when that opening is mapped free, so the route stays on corridors the scan has already cleared. The policy is given one cell-centre waypoint, up to two cells along that graph (short of the five-cell training maximum, which made it sprint into walls), and the next few metres of the path. A side branch behind the robot does not outrank the corridor still open ahead.
 
-Training and `Nepher-Go2-LidarMaze-HL-Play-v0` take waypoints from a privileged A* on the maze graph. `Nepher-Go2-LidarMaze-Planner-Play-v0` never reads that graph and never reads the `path:` line in the maze text file. It parses only `start_x`, `start_y`, `end_x`, `end_y`.
+Training and `Nepher-Go2-LidarMaze-HL-Play-v0` take waypoints from a privileged A* on the maze graph. The online planner never reads that graph and never reads the `path:` line. On every reset, each environment draws a random start cell and a different random goal cell, and draws again when A* finds no path between them. The robot is placed on the start centre plus ±0.4 m, with a yaw in [-π, π). The goal is that cell's centre.
 
 The maze USD is spawned once, at `/World/Maze`. Every environment shares it (`env_spacing = 0`, robot-robot collisions filtered). The LiDAR sits on top of the head, in the base frame, and ray-casts the maze, the ground plane at `/World/ground/terrain`, and that robot's own visual meshes. Robots do not see each other. A beam stops on a wall, the floor, or the body.
 
@@ -36,7 +36,8 @@ Gym ids:
 | `Nepher-Go2-LidarMaze-LL-Play-v0` | Play it, at the final command ranges |
 | `Nepher-Go2-LidarMaze-HL-v0` | Train the maze policy on privileged waypoints |
 | `Nepher-Go2-LidarMaze-HL-Play-v0` | Play that task with one environment. Loads the latest high-level checkpoint |
-| `Nepher-Go2-LidarMaze-Planner-Play-v0` | Same policy with the online planner. Start and goal from the text file |
+| `Nepher-Go2-LidarMaze-Planner-Play-v0` | Same policy with the online planner. New reachable start and goal per robot each episode |
+| `Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0` | Same planner on the `go2-maze-v0` benchmark. One robot per maze tile, fixed spawn and goal. Loads `best_policy/best_policy.pt` |
 
 ## Train
 
@@ -50,9 +51,24 @@ Each of those drawings has its own switch, and each defaults to off. Append any 
 .\isaaclab.bat train --task Nepher-Go2-LidarMaze-HL-v0 --viz none
 .\isaaclab.bat play --task Nepher-Go2-LidarMaze-HL-Play-v0 --viz none
 .\isaaclab.bat play --task Nepher-Go2-LidarMaze-Planner-Play-v0 --viz none
+.\isaaclab.bat play --task Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0 --video --num_envs 60
 ```
 
-`export_ll_policy.py` writes the TorchScript file `best_policy/ll_policy/ll_policy.pt`. The high-level task loads that file as the frozen velocity policy and raises `FileNotFoundError` until it exists. High-level play loads the latest `model_*.pt` under `logs/go2_lidar_maze_hl` unless you pass `--checkpoint`.
+`--video` on the benchmark play task does not use the stock one-frame-per-step recorder. The high-level policy still runs at 10 Hz. The viewport is drawn on every low-level tick and the mp4 is encoded at 50 fps, so playback matches robot time. The camera starts about 10 degrees off vertical. It holds a view of every maze for 4 s, then visits four mazes chosen from the environment seed: 2 s to move in, 4 s with that maze filling the frame top to bottom, 20 s a little lower following that maze's robot, then on to the next. The mp4 is written under the loaded checkpoint's `videos/play/` directory. Do not combine this with `--viz none`.
+
+## Evaluate on go2-maze-v0
+
+`Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0` loads the EnvHub bundle `go2-maze-v0`: 60 enclosed mazes, one robot on each tile, the spawn and goal taken from that maze. The online planner uses each tile's own cell pitch and origin. eval-nav scores it with `navigation.go2` v1.
+
+From `f:\isaacLab`:
+
+```powershell
+.\isaaclab.bat -p source\eval-nav\scripts\evaluate.py --config source\eval-nav\configs\task-go2-lidar-maze.yaml --viz none
+```
+
+`policy_path: default` resolves to `best_policy/best_policy.pt` in this project. The frozen velocity policy still has to be at `best_policy/ll_policy/ll_policy.pt`.
+
+`export_ll_policy.py` writes the TorchScript file `best_policy/ll_policy/ll_policy.pt`. The high-level task loads that file as the frozen velocity policy and raises `FileNotFoundError` until it exists. `Nepher-Go2-LidarMaze-HL-Play-v0` and `Nepher-Go2-LidarMaze-Planner-Play-v0` load the latest `model_*.pt` under `logs/go2_lidar_maze_hl` unless you pass `--checkpoint`. `Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0` loads `best_policy/best_policy.pt`.
 
 While playing the low-level policy, measure the realized deceleration `a_b` and the tracking lag `tau_ll`. The braking reward uses `a_b = 2.5 m/s²` and `tau = 0.2 s` until those measurements replace them (`BRAKE_DECEL_MPS2` and `BRAKE_LATENCY_S` in `constants.py`).
 
@@ -64,7 +80,7 @@ Simulation `dt = 0.005 s`. The low-level policy runs every 4 physics steps (50 H
 
 One cell is 2.5 m. The A* path from the robot to the active waypoint is 1 to 5 cells long (2.5 m to 12.5 m), in training and at deployment. The only exception is the final goal, which may be closer than one cell.
 
-In training the waypoint is held until the robot is within 0.5 m, and that arrival ends the episode successfully. The reset places the robot on a random cell centre plus ±0.4 m, with a yaw drawn from \([-\pi, \pi)\), and samples a new privileged waypoint from that pose. At deployment the waypoint is held until the same radius, then the next one is issued without resetting. It is also dropped early if it lands in an occupied or inflated cell, or if newly discovered walls push its A* length past 5 cells. The path is rebuilt every 2 s.
+In training the waypoint is held until the robot is within 0.5 m, and that arrival ends the episode successfully. The reset places the robot on a random cell centre plus ±0.4 m, with a yaw drawn from \([-\pi, \pi)\), and samples a new privileged waypoint from that pose. At deployment the waypoint is held until the same radius, then the next one is issued without resetting. It is dropped early when a newly discovered wall lies on that committed path. Until then the same waypoint is held, which is what the policy saw in training.
 
 Training draws length `k_max` with probability 0.5 and otherwise draws uniformly from 1 to `k_max - 1`. `k_max` starts at 1, where the two rules agree. A window pools resetting episodes until it has 256 of them and at least 512 issued waypoints; episodes with no waypoint yet are left out. Each privileged episode issues one waypoint, so the reach rate is the fraction of episodes that arrived. The window passes when the rate at length `k_max` is at least 80% and fewer than half of those episodes collided. Shorter lengths stay in the window but do not open the gate. `k_max` increases by one cell after two passing windows in a row, then waits out one episode so the next window is commanded at the new length. The waypoint target is the sampled cell centre plus ±0.4 m of jitter.
 

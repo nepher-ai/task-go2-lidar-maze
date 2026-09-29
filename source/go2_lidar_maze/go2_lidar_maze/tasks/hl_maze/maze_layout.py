@@ -10,7 +10,8 @@ midpoint hits at about 1 m when a wall is present. The resulting 4-connected
 graph is searched with A*, and every pair whose path is 1 to 5 cells long is
 stored so training can sample waypoints without running a search per reset.
 
-Play mode must not import this module.
+The online planner must not import this module. Reset sampling may use the
+adjacency so it can reject a start and goal that A* cannot join.
 """
 
 from __future__ import annotations

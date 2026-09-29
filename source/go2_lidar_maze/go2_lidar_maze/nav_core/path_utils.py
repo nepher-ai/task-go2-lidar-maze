@@ -274,6 +274,55 @@ def project_batch(
     return gathered_s, gathered_e
 
 
+def commit_prefix(
+    points: torch.Tensor,
+    seen: torch.Tensor,
+    blocked: torch.Tensor,
+    *,
+    probe_m: float = 2.5,
+    max_m: float = 15.0,
+) -> tuple[torch.Tensor, int]:
+    """Keep the visible part of a route, plus a short probe while it is short.
+
+    The waypoint policy was trained on corridor centre-lines. A point several
+    metres inside unknown space often lies past a wall the scan has not reached,
+    so the prefix stops at the last seen vertex once that vertex is at least
+    ``probe_m`` along the route. Until then, unknown vertices are kept out to
+    ``probe_m`` so the robot still has a target. A blocked vertex always ends
+    the prefix.
+
+    Args:
+        points: Route vertices ``(K, 2)`` [m], starting at the robot.
+        seen: True where a vertex lies in confirmed free space ``(K,)``.
+        blocked: True where a vertex lies in an inflated wall ``(K,)``.
+        probe_m: How far into unknown space a short route may reach [m].
+        max_m: Longest prefix retained for the waypoint and the look-ahead [m].
+
+    Returns:
+        The prefix ``(M, 2)`` and the index of its last seen vertex. The index
+        is 0 when no vertex was seen.
+    """
+    if points.shape[0] == 0:
+        raise ValueError("commit_prefix received an empty path.")
+    cum = cumulative_length(points)
+    last_seen = 0
+    end = 1
+    for index in range(1, points.shape[0]):
+        if bool(blocked[index]) or float(cum[index]) > max_m:
+            break
+        if bool(seen[index]):
+            last_seen = index
+            end = index + 1
+            continue
+        if last_seen > 0 and float(cum[last_seen]) >= probe_m:
+            break
+        if float(cum[index]) <= probe_m:
+            end = index + 1
+        else:
+            break
+    return points[:end], last_seen
+
+
 def high_water(s_bar: torch.Tensor, s_new: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance a high-water mark and return ``(new_mark, progress)``."""
     updated = torch.maximum(s_bar, s_new)

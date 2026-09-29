@@ -39,3 +39,14 @@ gym.register(
         "default_agent": "rsl_rl",
     },
 )
+
+gym.register(
+    id="Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0",
+    entry_point="go2_lidar_maze.tasks.hl_maze.maze_env:Go2MazeEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.maze_env_cfg:Go2MazeEnvCfg_PLANNER_Envhub_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go2MazePPORunnerCfg_ENVHUB_PLAY",
+        "default_agent": "rsl_rl",
+    },
+)

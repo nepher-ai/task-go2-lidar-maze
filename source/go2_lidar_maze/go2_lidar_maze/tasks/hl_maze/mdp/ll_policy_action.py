@@ -45,6 +45,8 @@ class LlPolicyAction(ActionTerm):
                 "That writes best_policy/ll_policy/ll_policy.pt."
             )
         self.policy = torch.jit.load(read_file(cfg.policy_path)).to(env.device).eval()
+        for param in self.policy.parameters():
+            param.requires_grad_(False)
         self._raw_actions = torch.zeros(self.num_envs, 3, device=self.device)
         self._prev_cmd = torch.zeros(self.num_envs, 3, device=self.device)
         self._low_level_action_term: ActionTerm = cfg.low_level_actions.class_type(cfg.low_level_actions, env)
@@ -90,7 +92,12 @@ class LlPolicyAction(ActionTerm):
         """Step the frozen policy every ``low_level_decimation`` physics steps."""
         if self._counter % self.cfg.low_level_decimation == 0:
             low_level_obs = self._low_level_obs_manager.compute_group("ll_policy")
-            self.low_level_actions[:] = self.policy(low_level_obs)
+            # Eval-nav steps with autograd on. The frozen net must not return a
+            # grad tensor; Warp rejects those joint targets. no_grad (not
+            # inference_mode) so the result can be copied into the action buffer.
+            with torch.no_grad():
+                predicted = self.policy(low_level_obs)
+            self.low_level_actions[:] = predicted
             self._low_level_action_term.process_actions(self.low_level_actions)
             self._counter = 0
         self._low_level_action_term.apply_actions()

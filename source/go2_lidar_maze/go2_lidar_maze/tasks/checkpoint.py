@@ -23,8 +23,10 @@ def prefer_checkpoint_file() -> None:
         return
 
     def get_checkpoint_path(log_path, run_dir=".*", checkpoint=".*", *args, **kwargs):
-        if isinstance(checkpoint, str) and os.path.isfile(checkpoint):
-            return os.path.abspath(checkpoint)
+        if isinstance(checkpoint, str) and os.path.isabs(checkpoint):
+            if os.path.isfile(checkpoint):
+                return checkpoint
+            raise FileNotFoundError(f"Checkpoint file not found: '{checkpoint}'.")
         return current(log_path, run_dir, checkpoint, *args, **kwargs)
 
     get_checkpoint_path._go2_file_shortcut = True  # type: ignore[attr-defined]
