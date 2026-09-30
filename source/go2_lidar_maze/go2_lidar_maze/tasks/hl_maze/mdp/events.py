@@ -47,9 +47,19 @@ def enlarge_physx_aggregate_pairs(env, env_ids=None) -> None:
         prim.CreateAttribute(name, Sdf.ValueTypeNames.UInt).Set(value)
 
 
+def _env_count(env, env_ids: torch.Tensor | slice) -> int:
+    """How many environments ``env_ids`` selects.
+
+    A full ``env.reset()`` passes ``slice(None)``. A partial reset passes a tensor.
+    """
+    if isinstance(env_ids, slice):
+        return len(range(env.num_envs)[env_ids])
+    return int(env_ids.shape[0])
+
+
 def reset_go2_in_maze(
     env,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> None:
     """Place robots on corridor centres, with ±0.4 m jitter, or on the fixed start.
@@ -61,7 +71,7 @@ def reset_go2_in_maze(
     """
     robot = env.scene[asset_cfg.name]
     pose = robot.data.default_root_pose.torch[env_ids].clone()
-    count = env_ids.shape[0]
+    count = _env_count(env, env_ids)
     if env.cfg.sample_start_goal:
         start_xy, goal_xy = _corridor_graph(env).sample(count, robot.device)
         jitter = (torch.rand(count, 2, device=robot.device) - 0.5) * (2.0 * SPAWN_JITTER_M)
@@ -96,7 +106,7 @@ def reset_go2_in_maze(
 
 def reset_go2_from_scenario(
     env,
-    env_ids: torch.Tensor,
+    env_ids: torch.Tensor | slice,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> None:
     """Place each robot on its scenario spawn. No jitter.
@@ -110,7 +120,7 @@ def reset_go2_from_scenario(
     yaw = env._scenario_spawn_yaw[env_ids]
     pose[:, 0] = spawn_xy[:, 0]
     pose[:, 1] = spawn_xy[:, 1]
-    count = env_ids.shape[0]
+    count = _env_count(env, env_ids)
     zeros = torch.zeros(count, device=robot.device)
     pose[:, 3:7] = math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
     velocity = torch.zeros(count, 6, device=robot.device)

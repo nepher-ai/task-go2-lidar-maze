@@ -125,8 +125,12 @@ class WaypointCommand(CommandTerm):
         issued = self.issued_count.clamp(min=1.0)
         self.metrics["waypoint_success"][:] = self.reached_count / issued
 
-    def _resample_command(self, env_ids: Sequence[int]):
-        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
+    def _resample_command(self, env_ids: Sequence[int] | slice):
+        # A full reset passes slice(None). The planner reset walks integer indices.
+        if isinstance(env_ids, slice):
+            ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+        else:
+            ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
         self._remember_outcome(ids)
         self.reached_count[ids] = 0.0
         self.issued_count[ids] = 0.0

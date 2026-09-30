@@ -11,6 +11,8 @@ USD Python bindings before Kit starts.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
@@ -22,6 +24,9 @@ from go2_lidar_maze.tasks.hl_maze.film_recorder import MazeFilm, claim_video
 from go2_lidar_maze.tasks.hl_maze.lidar_vis import attach_lidar_vis
 from go2_lidar_maze.tasks.hl_maze.mdp.events import enlarge_physx_aggregate_pairs
 from go2_lidar_maze.tasks.hl_maze.maze_env_cfg import Go2MazeEnvCfg
+
+# PhysX logs this channel once per prim while building the stage-wide body view.
+_TENSORS_CHANNEL = "omni.physx.tensors.plugin"
 
 
 class Go2MazeEnv(ManagerBasedRLEnv):
@@ -80,18 +85,44 @@ class Go2MazeEnv(ManagerBasedRLEnv):
         self.goal_xy[:] = self._scenario_goal_xy
 
     def _init_sim(self):
-        """Write PhysX GPU capacities as ``UInt`` immediately before physics play."""
+        """Write PhysX GPU capacities as ``UInt`` immediately before physics play.
+
+        That reset also builds the stage-wide rigid-body view. The scan warns once
+        per joint, mesh, and xform, so its channel stays at error until reset returns.
+        """
         sim_reset = self.sim.reset
 
         def _reset(soft: bool = False):
             enlarge_physx_aggregate_pairs(self, None)
-            sim_reset(soft)
+            with _quiet_rigid_body_scan():
+                sim_reset(soft)
 
         self.sim.reset = _reset  # type: ignore[method-assign]
         try:
             super()._init_sim()
         finally:
             self.sim.reset = sim_reset  # type: ignore[method-assign]
+
+
+@contextmanager
+def _quiet_rigid_body_scan():
+    """Hold the tensors channel at error across the stage-wide rigid-body scan.
+
+    The previous level is restored, including the case where the channel did not
+    exist yet. A missing body after startup still warns.
+    """
+    import omni.log
+
+    log = omni.log.get_log()
+    result, level, behavior = log.get_channel_level(_TENSORS_CHANNEL)
+    log.set_channel_level(_TENSORS_CHANNEL, omni.log.Level.ERROR, omni.log.SettingBehavior.OVERRIDE)
+    try:
+        yield
+    finally:
+        if result == 0:
+            log.set_channel_level(_TENSORS_CHANNEL, level, behavior)
+        else:
+            log.set_channel_level(_TENSORS_CHANNEL, omni.log.Level.WARN, omni.log.SettingBehavior.INHERIT)
 
 
 def _fit_ground_to_tiles(env: Go2MazeEnv) -> None:
