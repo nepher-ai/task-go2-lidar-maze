@@ -3,31 +3,31 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Online map and a single waypoint on the confirmed corridor graph.
+"""Online map and a waypoint on space the LiDAR has cleared.
 
 The map is empty at the start of every episode. LiDAR hits are walls and the
-beams in front of them are free. A doorway counts as open only when that
-opening is mapped free, so the route cannot cross a wall the scan has not
-already disproved. The waypoint is a corridor-cell centre, one to five cells
-ahead, which is the contract the high-level policy was trained on.
+beams in front of them are free. A distance field on that grid reaches the
+goal without a maze lattice: inflated walls block, unseen cells cost more
+than cells the scan has cleared, and the waypoint is the seen prefix of the
+route, at most 5 m and about 1 m short of the first sharp corner. A point
+that sits against a mapped wall is pulled back along that line.
 """
 
 from __future__ import annotations
 
 import math
-from collections import deque
 
 import torch
 
-from go2_lidar_maze.constants import (
-    CELL_CENTER_ORIGIN_M,
-    CELL_PITCH_M,
-    GRID_SIZE,
-    MAX_ASTAR_CELLS,
-    MIN_ASTAR_CELLS,
-)
+from go2_lidar_maze.constants import CELL_PITCH_M, MAX_ASTAR_CELLS, MIN_ASTAR_CELLS
 from go2_lidar_maze.nav_core.occupancy import OccupancyGrid
 from go2_lidar_maze.nav_core.path_utils import cumulative_length, fillet_polyline, point_at_distance, points_at_arc_length
+from go2_lidar_maze.nav_core.planner import (
+    UNREACHABLE,
+    _clearance_penalty,
+    distance_field_batch,
+    trace_route_batch,
+)
 
 _PLAN_RES_M = 0.25
 _INFLATE_CELLS = 1
@@ -36,22 +36,35 @@ _INFLATE_CELLS = 1
 _GRID_CELLS = 480
 _GRID_RES_M = 0.25
 _MIN_COVERAGE_M = 120.0
-# Across the opening, inside the 2 m corridor, and through the 0.5 m wall slab.
-# The scan hits the near face, not the middle of the slab, so the slab has to be sampled.
-_DOOR_ACROSS_M = (-0.6, -0.3, 0.0, 0.3, 0.6)
-_DOOR_THROUGH_M = (-0.45, -0.3, -0.15, 0.0, 0.15, 0.3, 0.45)
-# Short of the wall face (1.0 m from the cell centre) so a look does not collide.
-_PEEK_M = 0.75
-# Five cells is the training maximum, but a 12 m carrot makes this policy
-# sprint and clip the corridor. Two cells stays inside the speeds it survived.
-_ONLINE_MAX_CELLS = 2
-_UNKNOWN = 0
-_FREE = 1
-_WALL = 2
-# Online routes are the robot plus at most two cell centres.
-_MAX_ROUTE_POINTS = 8
-# Sample spacing is one grid cell, and a two-cell route is under 8 m.
+# Two training cells. A longer carrot makes this policy sprint into walls.
+_LOOKAHEAD_M = 5.0
+# Trace past the lookahead so the corner cut can see the next segment.
+_TRACE_M = 8.0
+# Grid chamfers are about 45 deg. A corridor corner is about 90 deg.
+_TURN_RAD = math.radians(50.0)
+_TURN_MIN_M = 1.0
+# Stop this far before the corner vertex [m]. The vertex itself is the inside
+# of the turn, and this policy drives into that wall.
+_CORNER_BACKOFF_M = 1.0
+_MIN_CARROT_M = 1.5
+# Pull the endpoint back while it is this close to a mapped wall [m].
+_WALL_CLEAR_M = 0.75
+# A mapped corridor wins unless the unscanned shortcut is several times shorter.
+_UNKNOWN_COST = 3.0
+# One-time extra cost [m] for a first step behind the robot.
+_REVERSE_PENALTY_M = 4.0
+_CLEARANCE_RADIUS = 2
+_CLEARANCE_WEIGHT = 1.0
+_CROP_MARGIN_M = 6.0
+# Close start and goal cells can still need a tour of the tile. Cover that,
+# not only the chord, or the field treats the detour as a wall.
+_MIN_CROP_M = 48.0
+_MAX_FIELD_CELLS = 160
+_FIELD_EVERY = 5
+_MAX_ROUTE_POINTS = 96
 _ROUTE_CHECK_SAMPLES = 48
+_SIMPLIFY_M = 0.5
+_FOOTPRINT_M = 0.45
 
 
 def select_waypoint_on_path(
@@ -88,27 +101,14 @@ def select_waypoint_on_path(
 class NavigationStack:
     """Per-environment occupancy map and waypoint selector."""
 
-    def __init__(
-        self,
-        num_envs: int,
-        device: torch.device | str,
-        *,
-        cell_origin_xy: torch.Tensor | None = None,
-        cell_pitch: torch.Tensor | None = None,
-        grid_n: torch.Tensor | None = None,
-    ) -> None:
+    def __init__(self, num_envs: int, device: torch.device | str) -> None:
         """Build one occupancy map per environment.
 
-        ``cell_origin_xy`` is the world XY [m] of cell ``(0, 0)``, shape ``(N, 2)``.
-        ``cell_pitch`` is the corridor pitch [m], shape ``(N,)``. ``grid_n`` is the
-        maze edge in cells, shape ``(N,)``. Omitted tensors use the 20×20 training
-        maze (origin 1.5 m, pitch 2.5 m).
+        The map is anchored from the robot and the goal at reset. It does not
+        store a maze lattice.
         """
         self.num_envs = num_envs
         self.device = torch.device(device)
-        self.cell_origin_xy = _per_env_origin(num_envs, self.device, cell_origin_xy)
-        self.cell_pitch = _per_env_pitch(num_envs, self.device, cell_pitch)
-        self.grid_n = _per_env_n(num_envs, self.device, grid_n)
         self.grid = OccupancyGrid(
             num_envs=num_envs, device=self.device, resolution=_GRID_RES_M, size=_GRID_CELLS
         )
@@ -118,8 +118,11 @@ class NavigationStack:
         self._cached: dict[int, tuple[torch.Tensor, torch.Tensor, float]] = {}
         self._route_xy = torch.zeros((num_envs, _MAX_ROUTE_POINTS, 2), device=self.device)
         self._route_n = torch.zeros(num_envs, dtype=torch.long, device=self.device)
-        # Unknown doors the robot has already stood in front of. Cleared on reset.
-        self._rejected: dict[int, set[tuple[tuple[int, int], tuple[int, int]]]] = {}
+        self.field_age = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        self.field_ready = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        self.planned_xy = torch.zeros((num_envs, 2), device=self.device)
+        self._fields: list[dict | None] = [None] * num_envs
+        self._paths: list[torch.Tensor | None] = [None] * num_envs
 
     def reset(self, env_ids: torch.Tensor, robot_xy: torch.Tensor, goal_xy: torch.Tensor) -> None:
         """Wipe the map and anchor it halfway between the robot and the goal."""
@@ -133,15 +136,19 @@ class NavigationStack:
         self._age[env_ids] = 0
         self._have_plan[env_ids] = False
         self._route_n[env_ids] = 0
+        self.field_age[env_ids] = 0
+        self.field_ready[env_ids] = False
         for index in env_ids.tolist():
             self._cached.pop(int(index), None)
-            self._rejected.pop(int(index), None)
+            self._fields[int(index)] = None
+            self._paths[int(index)] = None
 
     @torch.no_grad()
     def update(self, ray_hits_w: torch.Tensor, sensor_pos_w: torch.Tensor) -> None:
         """Fold the latest LiDAR scan into the map."""
         self.grid.update(ray_hits_w, sensor_pos_w)
         self._age += 1
+        self.field_age += 1
 
     def plan_waypoint(
         self,
@@ -157,17 +164,31 @@ class NavigationStack:
 
         Replanning runs when ``force`` is set, on the first call, or every
         ``replan_every`` control steps. ``hold_xy`` is accepted for callers
-        that still pass it; the issued point is always the current corridor target.
+        that still pass it; the issued point lies on seen-free space toward the goal.
         """
         due = force or (not bool(self._have_plan[env_index])) or int(self._age[env_index]) >= replan_every
         if not due and env_index in self._cached:
             return self._cached[env_index]
         del hold_xy
-        waypoint, path, length = self._plan_one(env_index, robot_xy, heading_xy)
-        self._cached[env_index] = (waypoint, path, length)
-        self._have_plan[env_index] = True
-        self._age[env_index] = 0
-        return waypoint, path, length
+        mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        mask[env_index] = True
+        robots = torch.zeros((self.num_envs, 2), device=self.device)
+        robots[env_index] = robot_xy
+        headings = None
+        if heading_xy is not None:
+            headings = torch.zeros((self.num_envs, 2), device=self.device)
+            headings[env_index] = heading_xy
+        if force:
+            self.field_ready[env_index] = False
+        self.plan_mask(mask, robots, headings)
+        return self._cached[env_index]
+
+    def path_of(self, index: int) -> torch.Tensor:
+        """Last path issued for ``index``, shape ``(K, 2)`` [m]."""
+        path = self._paths[index]
+        if path is None:
+            return self.planned_xy[index].unsqueeze(0)
+        return path
 
     def waypoint_invalid(self, env_index: int, robot_xy: torch.Tensor, waypoint_xy: torch.Tensor) -> bool:
         """True when the waypoint or the committed route has entered a wall.
@@ -199,7 +220,7 @@ class NavigationStack:
         frac = slot.view(1, -1) / (steps - 1).clamp(min=1).unsqueeze(1)
         dist = frac * total.unsqueeze(1)
         points = points_at_arc_length(self._route_xy, dist)
-        near = torch.linalg.norm(points - robot_xy.unsqueeze(1), dim=-1) < 0.45
+        near = torch.linalg.norm(points - robot_xy.unsqueeze(1), dim=-1) < _FOOTPRINT_M
         keep = slot.view(1, -1) < steps.unsqueeze(1)
         hit = self._walls_at(walls, points) & keep & ~near & ~short.unsqueeze(1)
         return on_wall | missing | hit.any(dim=-1)
@@ -226,30 +247,310 @@ class NavigationStack:
         """True when the map has been updated for ``replan_every`` control steps."""
         return int(self._age[env_index]) >= replan_every
 
-    def _plan_one(
+    def field_due(self) -> torch.Tensor:
+        """True where the distance field is missing or older than the refresh interval."""
+        return ~self.field_ready | (self.field_age >= _FIELD_EVERY)
+
+    @torch.no_grad()
+    def refresh_fields(
         self,
-        env_index: int,
+        mask: torch.Tensor,
+        robot_xy: torch.Tensor,
+        heading_xy: torch.Tensor | None = None,
+    ) -> None:
+        """Recompute cached distance fields for environments in ``mask``.
+
+        ``robot_xy`` is ``(N, 2)`` [m]. ``heading_xy`` is an optional planar
+        heading ``(N, 2)``. An environment with no free cells keeps an empty
+        field and stays not ready, so the next scan is picked up immediately.
+        """
+        if not bool(mask.any()):
+            return
+        ids = [int(index) for index in mask.nonzero(as_tuple=False).flatten().tolist()]
+        crops: list[tuple[int, dict]] = []
+        for index in ids:
+            if int(self.grid.free_counts[index].sum()) <= 0:
+                self._fields[index] = None
+                self.field_ready[index] = False
+                continue
+            heading = None if heading_xy is None else heading_xy[index]
+            crops.append((index, self._build_crop(index, robot_xy[index], heading)))
+        if crops:
+            self._solve_crops(crops)
+        self.field_age[mask] = 0
+
+    @torch.no_grad()
+    def plan_mask(
+        self,
+        mask: torch.Tensor,
+        robot_xy: torch.Tensor,
+        heading_xy: torch.Tensor | None = None,
+    ) -> None:
+        """Issue waypoints for ``mask`` from the cached fields.
+
+        A field is rebuilt when it is missing, older than ``_FIELD_EVERY``
+        scans, or no longer contains the robot. Results land in
+        :attr:`planned_xy` and :meth:`path_of`.
+        """
+        if not bool(mask.any()):
+            return
+        cover = torch.ones_like(mask)
+        for index in mask.nonzero(as_tuple=False).flatten().tolist():
+            cover[int(index)] = self._field_covers(int(index), robot_xy[int(index)])
+        stale = mask & (~self.field_ready | (self.field_age >= _FIELD_EVERY) | ~cover)
+        self.refresh_fields(stale, robot_xy, heading_xy)
+        self._trace_mask(mask, robot_xy)
+        self._age[mask] = 0
+        self._have_plan[mask] = True
+
+    def _solve_crops(self, crops: list[tuple[int, dict]]) -> None:
+        """One batched field for every crop, then slice the padding back off."""
+        max_h = max(int(crop["occupied"].shape[0]) for _index, crop in crops)
+        max_w = max(int(crop["occupied"].shape[1]) for _index, crop in crops)
+        batch = len(crops)
+        device = self.device
+        occupied = torch.ones((batch, max_h, max_w), dtype=torch.bool, device=device)
+        step = torch.ones((batch, max_h, max_w), dtype=torch.float32, device=device)
+        goal = torch.zeros((batch, 2), dtype=torch.long, device=device)
+        robot = torch.zeros((batch, 2), dtype=torch.long, device=device)
+        res = torch.zeros(batch, dtype=torch.float32, device=device)
+        for slot, (_index, crop) in enumerate(crops):
+            height, width = crop["occupied"].shape
+            occupied[slot, :height, :width] = crop["occupied"]
+            step[slot, :height, :width] = crop["step"]
+            goal[slot] = crop["goal"]
+            robot[slot] = crop["robot"]
+            res[slot] = crop["coarse_res"]
+        # A wave crosses the crop in about H + W sweeps. Two quiet checks end it.
+        dist = distance_field_batch(
+            occupied,
+            goal,
+            res,
+            step_cost=step,
+            robot=robot,
+            max_iters=min(1024, (max_h + max_w) * 2),
+            check_every=8,
+        )
+        for slot, (index, crop) in enumerate(crops):
+            height, width = crop["occupied"].shape
+            self._fields[index] = {
+                "dist": dist[slot, :height, :width].contiguous(),
+                "seen": crop["seen"],
+                "r0": crop["r0"],
+                "c0": crop["c0"],
+                "factor": crop["factor"],
+                "res": crop["res"],
+                "origin": crop["origin"],
+                "half": crop["half"],
+            }
+            self.field_ready[index] = True
+
+    def _trace_mask(self, mask: torch.Tensor, robot_xy: torch.Tensor) -> None:
+        real: list[int] = []
+        for index in mask.nonzero(as_tuple=False).flatten().tolist():
+            index = int(index)
+            if self._fields[index] is None:
+                self._set_wait(index, robot_xy[index])
+            else:
+                real.append(index)
+        if not real:
+            return
+        dists = [self._fields[index]["dist"] for index in real]
+        max_h = max(int(dist.shape[0]) for dist in dists)
+        max_w = max(int(dist.shape[1]) for dist in dists)
+        batch = len(real)
+        padded = torch.full((batch, max_h, max_w), UNREACHABLE, device=self.device)
+        starts = torch.zeros((batch, 2), dtype=torch.long, device=self.device)
+        res = torch.zeros(batch, dtype=torch.float32, device=self.device)
+        for slot, index in enumerate(real):
+            field = self._fields[index]
+            dist = field["dist"]
+            height, width = dist.shape
+            padded[slot, :height, :width] = dist
+            row, col = self._local_cell(field, robot_xy[index], clamp=True)
+            starts[slot, 0] = row
+            starts[slot, 1] = col
+            res[slot] = float(field["res"]) * int(field["factor"])
+        cells, counts = trace_route_batch(
+            padded, starts, resolution=res, max_length_m=_TRACE_M, max_steps=64
+        )
+        for slot, index in enumerate(real):
+            count = int(counts[slot].item())
+            self._commit_route(index, robot_xy[index], cells[slot, :count])
+
+    def _build_crop(
+        self,
+        index: int,
         robot_xy: torch.Tensor,
         heading_xy: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        rejected = self._rejected.setdefault(env_index, set())
-        raw = _corridor_polyline(
-            self.grid,
-            env_index,
-            robot_xy,
-            self._goal_xy[env_index],
-            rejected,
-            heading_xy,
-            origin_xy=self.cell_origin_xy[env_index],
-            pitch=float(self.cell_pitch[env_index]),
-            n=int(self.grid_n[env_index]),
-        )
-        self._store_route(env_index, raw)
-        # Fillet matches privileged training. Endpoints stay on the cell centres.
-        path_xy = fillet_polyline(raw, radius=0.5)
-        waypoint = raw[-1]
-        length = float(cumulative_length(path_xy)[-1])
-        return waypoint, path_xy, length
+    ) -> dict:
+        """Cost crop around the known map, the robot, and the goal."""
+        raw = self.grid.counts[index] >= self.grid.hit_threshold
+        unknown = (self.grid.free_counts[index] <= 0) & ~raw
+        res = float(self.grid.res[index])
+        origin = self.grid.origin[index]
+        half = self.grid.size // 2
+        known = raw | (self.grid.free_counts[index] > 0)
+        robot_rc = self._world_cell(robot_xy, origin, res, half)
+        goal_rc = self._world_cell(self._goal_xy[index], origin, res, half)
+        margin = int(math.ceil(_CROP_MARGIN_M / max(res, 1e-6)))
+        if bool(known.any()):
+            rows = known.any(dim=1).nonzero().flatten()
+            cols = known.any(dim=0).nonzero().flatten()
+            r0, r1 = int(rows[0]), int(rows[-1]) + 1
+            c0, c1 = int(cols[0]), int(cols[-1]) + 1
+        else:
+            r0, r1, c0, c1 = robot_rc[0], robot_rc[0] + 1, robot_rc[1], robot_rc[1] + 1
+        mid = 0.5 * (robot_xy + self._goal_xy[index])
+        half_span = torch.tensor([_MIN_CROP_M * 0.5, _MIN_CROP_M * 0.5], device=robot_xy.device)
+        cover_lo = self._world_cell(mid - half_span, origin, res, half)
+        cover_hi = self._world_cell(mid + half_span, origin, res, half)
+        r0 = max(0, min(r0, robot_rc[0], goal_rc[0], cover_lo[0]) - margin)
+        c0 = max(0, min(c0, robot_rc[1], goal_rc[1], cover_lo[1]) - margin)
+        r1 = min(self.grid.size, max(r1, robot_rc[0] + 1, goal_rc[0] + 1, cover_hi[0] + 1) + margin)
+        c1 = min(self.grid.size, max(c1, robot_rc[1] + 1, goal_rc[1] + 1, cover_hi[1] + 1) + margin)
+        factor = _pool_factor(r1 - r0, c1 - c0, res)
+        occupied = raw[r0:r1, c0:c1]
+        unseen = unknown[r0:r1, c0:c1]
+        if factor > 1:
+            occupied = _pad_to_factor(occupied, factor, True)
+            unseen = _pad_to_factor(unseen, factor, True)
+            occupied, unseen, factor = _coarsen(occupied, unseen, res, res * factor)
+        coarse_res = res * factor
+        inflated = _inflate(occupied, _INFLATE_CELLS)
+        robot_local = ((robot_rc[0] - r0) // factor, (robot_rc[1] - c0) // factor)
+        goal_local = ((goal_rc[0] - r0) // factor, (goal_rc[1] - c0) // factor)
+        height, width = inflated.shape
+        robot_local = (min(height - 1, max(0, robot_local[0])), min(width - 1, max(0, robot_local[1])))
+        goal_local = (min(height - 1, max(0, goal_local[0])), min(width - 1, max(0, goal_local[1])))
+        foot = _footprint_mask(inflated.shape, robot_local, coarse_res, inflated.device)
+        # Inflation must not trap the body. A real wall under the footprint stays blocked.
+        inflated = inflated & ~(foot & ~occupied)
+        penalty = _clearance_penalty(inflated, _CLEARANCE_RADIUS, _CLEARANCE_WEIGHT)
+        step = 1.0 + penalty
+        step = torch.where(unseen & ~occupied, step * _UNKNOWN_COST, step)
+        step = _reverse_cost(step, robot_xy, heading_xy, origin, res, half, r0, c0, factor, coarse_res)
+        seen = (~unseen & ~occupied) | (foot & ~occupied)
+        return {
+            "occupied": inflated,
+            "step": step,
+            "seen": seen,
+            "goal": torch.tensor(goal_local, dtype=torch.long, device=self.device),
+            "robot": torch.tensor(robot_local, dtype=torch.long, device=self.device),
+            "coarse_res": coarse_res,
+            "r0": r0,
+            "c0": c0,
+            "factor": int(factor),
+            "res": res,
+            "origin": origin,
+            "half": half,
+        }
+
+    def _commit_route(self, index: int, robot_xy: torch.Tensor, local: torch.Tensor) -> None:
+        """Clip the traced cells to seen space, then to the lookahead and the first corner."""
+        field = self._fields[index]
+        if field is None or local.shape[0] == 0:
+            self._set_wait(index, robot_xy)
+            return
+        kept = _seen_prefix(local, field["seen"])
+        if kept.shape[0] <= 1:
+            self._set_wait(index, robot_xy)
+            return
+        world = _cells_to_world(field, kept)
+        world = world.clone()
+        world[0] = robot_xy.reshape(2)
+        world = _drop_backtrack(world)
+        world = _simplify_polyline(world, _SIMPLIFY_M)
+        world, turned = _cut_turn(world, _TURN_MIN_M, _TURN_RAD)
+        if turned:
+            world = _shorten_end(world, _CORNER_BACKOFF_M, _MIN_CARROT_M)
+        world = _cap_length(world, _LOOKAHEAD_M)
+        world = self._pull_off_walls(index, world)
+        if world.shape[0] < 2 or float(torch.linalg.norm(world[-1] - world[0])) < 0.05:
+            self._set_wait(index, robot_xy)
+            return
+        stored = fillet_polyline(world, radius=0.5) if world.shape[0] >= 3 else world
+        self._remember(index, world[-1], stored)
+
+    def _remember(self, index: int, waypoint: torch.Tensor, stored: torch.Tensor) -> None:
+        self._store_route(index, stored)
+        self.planned_xy[index] = waypoint
+        self._paths[index] = stored
+        length = float(cumulative_length(stored)[-1]) if stored.shape[0] >= 2 else 0.0
+        self._cached[index] = (waypoint, stored, length)
+
+    def _pull_off_walls(self, index: int, world: torch.Tensor) -> torch.Tensor:
+        """Step the endpoint back while it is within ``_WALL_CLEAR_M`` of a wall.
+
+        Each pass must shorten the polyline. A cap that does not move the end
+        stops the walk, so a carrot lying against a wall cannot spin here.
+        """
+        if world.shape[0] < 2:
+            return world
+        length = float(cumulative_length(world)[-1])
+        for _ in range(32):
+            if length <= _MIN_CARROT_M or self._wall_distance(index, world[-1]) >= _WALL_CLEAR_M:
+                break
+            nxt = _cap_length(world, max(length - 0.25, _MIN_CARROT_M))
+            nxt_len = float(cumulative_length(nxt)[-1])
+            if nxt_len >= length - 1.0e-3:
+                break
+            world = nxt
+            length = nxt_len
+        return world
+
+    def _wall_distance(self, index: int, xy: torch.Tensor) -> float:
+        """Distance [m] from ``xy`` to the nearest mapped wall cell centre."""
+        res = float(self.grid.res[index])
+        origin = self.grid.origin[index]
+        half = int(self.grid._half)
+        size = int(self.grid.size)
+        rel = (xy - origin) / res
+        row = int(math.floor(float(rel[0]))) + half
+        col = int(math.floor(float(rel[1]))) + half
+        rad = int(math.ceil(_WALL_CLEAR_M / max(res, 1e-6))) + 1
+        r0, r1 = max(0, row - rad), min(size, row + rad + 1)
+        c0, c1 = max(0, col - rad), min(size, col + rad + 1)
+        window = self.grid.counts[index, r0:r1, c0:c1]
+        walls = window >= self.grid.hit_threshold
+        if not bool(walls.any()):
+            return 1.0e6
+        rr, cc = torch.where(walls)
+        centers_x = (r0 + rr.to(torch.float32) - half + 0.5) * res + float(origin[0])
+        centers_y = (c0 + cc.to(torch.float32) - half + 0.5) * res + float(origin[1])
+        delta_x = centers_x - float(xy[0])
+        delta_y = centers_y - float(xy[1])
+        return float(torch.sqrt(delta_x * delta_x + delta_y * delta_y).min())
+
+    def _set_wait(self, index: int, robot_xy: torch.Tensor) -> None:
+        """No seen route yet. Hold the waypoint on the robot."""
+        point = robot_xy.reshape(2)
+        self._remember(index, point, point.unsqueeze(0))
+
+    def _field_covers(self, index: int, robot_xy: torch.Tensor) -> bool:
+        field = self._fields[index]
+        if field is None:
+            return False
+        row, col = self._local_cell(field, robot_xy, clamp=False)
+        height, width = field["dist"].shape
+        return 0 <= row < height and 0 <= col < width
+
+    def _local_cell(self, field: dict, xy: torch.Tensor, *, clamp: bool) -> tuple[int, int]:
+        row, col = self._world_cell(xy, field["origin"], float(field["res"]), int(field["half"]))
+        local = ((row - int(field["r0"])) // int(field["factor"]), (col - int(field["c0"])) // int(field["factor"]))
+        if not clamp:
+            return local
+        height, width = field["dist"].shape
+        return (min(height - 1, max(0, local[0])), min(width - 1, max(0, local[1])))
+
+    def _world_cell(
+        self, xy: torch.Tensor, origin: torch.Tensor, res: float, half: int
+    ) -> tuple[int, int]:
+        rel = (xy - origin) / res
+        row = int(math.floor(float(rel[0]))) + half
+        col = int(math.floor(float(rel[1]))) + half
+        last = self.grid.size - 1
+        return (max(0, min(last, row)), max(0, min(last, col)))
 
     def _store_route(self, env_index: int, raw: torch.Tensor) -> None:
         """Keep the committed polyline for the batched wall check."""
@@ -258,401 +559,199 @@ class NavigationStack:
         self._route_xy[env_index, :count] = raw[:count]
         self._route_n[env_index] = count
 
-    def _planning_grid(self, env_index: int):
-        occupied_fine = self.grid.obstacle_mask()[env_index]
-        unknown_fine = ~(self.grid.seen_free_mask()[env_index] | occupied_fine)
-        res = float(self.grid.res[env_index])
-        raw, unknown, factor = _coarsen(occupied_fine, unknown_fine, res, _PLAN_RES_M)
-        occupied = _inflate(raw, _INFLATE_CELLS)
-        return (
-            occupied,
-            unknown,
-            raw,
-            res,
-            self.grid.origin[env_index],
-            self.grid.size // 2,
-            factor,
-            res * factor,
-        )
+
+def _pool_factor(height: int, width: int, res: float) -> int:
+    """Coarsen so the field stays near ``_PLAN_RES_M`` and under ``_MAX_FIELD_CELLS``."""
+    factor = max(1, int(round(_PLAN_RES_M / max(res, 1e-6))))
+    while max(height, width) / factor > _MAX_FIELD_CELLS:
+        factor += 1
+    return factor
 
 
-def _per_env_origin(num_envs: int, device: torch.device, value: torch.Tensor | None) -> torch.Tensor:
-    """World XY [m] of cell ``(0, 0)`` for each environment, shape ``(N, 2)``."""
-    if value is None:
-        return torch.full((num_envs, 2), CELL_CENTER_ORIGIN_M, dtype=torch.float32, device=device)
-    origin = value.to(device=device, dtype=torch.float32)
-    if origin.shape != (num_envs, 2):
-        raise ValueError(f"cell_origin_xy must be {(num_envs, 2)}, got {tuple(origin.shape)}.")
-    return origin
+def _pad_to_factor(mask: torch.Tensor, factor: int, fill: bool) -> torch.Tensor:
+    """Pad the bottom and right edges so both sides divide by ``factor``."""
+    height, width = mask.shape
+    padded_h = (height + factor - 1) // factor * factor
+    padded_w = (width + factor - 1) // factor * factor
+    if padded_h == height and padded_w == width:
+        return mask
+    out = torch.full((padded_h, padded_w), fill, dtype=mask.dtype, device=mask.device)
+    out[:height, :width] = mask
+    return out
 
 
-def _per_env_pitch(num_envs: int, device: torch.device, value: torch.Tensor | None) -> torch.Tensor:
-    """Corridor pitch [m] per environment, shape ``(N,)``."""
-    if value is None:
-        return torch.full((num_envs,), CELL_PITCH_M, dtype=torch.float32, device=device)
-    pitch = value.to(device=device, dtype=torch.float32).reshape(-1)
-    if pitch.shape != (num_envs,):
-        raise ValueError(f"cell_pitch must be {(num_envs,)}, got {tuple(pitch.shape)}.")
-    return pitch
+def _footprint_mask(
+    shape: tuple[int, int], robot: tuple[int, int], res: float, device: torch.device
+) -> torch.Tensor:
+    """True for cells within ``_FOOTPRINT_M`` of ``robot``."""
+    height, width = shape
+    reach = max(1, int(math.ceil(_FOOTPRINT_M / max(res, 1e-6))))
+    r0, r1 = max(0, robot[0] - reach), min(height, robot[0] + reach + 1)
+    c0, c1 = max(0, robot[1] - reach), min(width, robot[1] + reach + 1)
+    rows = torch.arange(r0, r1, device=device)
+    cols = torch.arange(c0, c1, device=device)
+    dist2 = (rows.view(-1, 1) - robot[0]) ** 2 + (cols.view(1, -1) - robot[1]) ** 2
+    window = dist2 <= (_FOOTPRINT_M / max(res, 1e-6)) ** 2
+    mask = torch.zeros(shape, dtype=torch.bool, device=device)
+    mask[r0:r1, c0:c1] = window
+    return mask
 
 
-def _per_env_n(num_envs: int, device: torch.device, value: torch.Tensor | None) -> torch.Tensor:
-    """Maze edge length in cells per environment, shape ``(N,)``."""
-    if value is None:
-        return torch.full((num_envs,), GRID_SIZE, dtype=torch.long, device=device)
-    n = value.to(device=device, dtype=torch.long).reshape(-1)
-    if n.shape != (num_envs,):
-        raise ValueError(f"grid_n must be {(num_envs,)}, got {tuple(n.shape)}.")
-    return n
-
-
-def _corridor_polyline(
-    grid: OccupancyGrid,
-    env_index: int,
+def _reverse_cost(
+    step: torch.Tensor,
     robot_xy: torch.Tensor,
-    goal_xy: torch.Tensor,
-    rejected: set[tuple[tuple[int, int], tuple[int, int]]],
-    heading_xy: torch.Tensor | None = None,
-    *,
-    origin_xy: torch.Tensor,
-    pitch: float,
-    n: int,
-) -> torch.Tensor:
-    """Cell-centre polyline from the robot toward the goal, at most two cells.
-
-    Edges exist only where the doorway is mapped free. The target is the goal
-    when that graph reaches it, otherwise the frontier whose known distance
-    plus octile distance to the goal is smallest. A farther frontier wins a tie,
-    so a hallway is followed to its end instead of stopping at the entrance.
-    """
-    horizontal, vertical = _door_states(grid, env_index, origin_xy, pitch, n)
-    h_state = horizontal.tolist()
-    v_state = vertical.tolist()
-    # An empty map has no evidence either way. Probing toward the goal here
-    # aims through the nearest wall. Wait until a scan has classified a door.
-    if not any(value for row in h_state for value in row) and not any(value for row in v_state for value in row):
-        return robot_xy.unsqueeze(0)
-    start = _maze_cell(robot_xy, origin_xy, pitch, n)
-    goal = _maze_cell(goal_xy, origin_xy, pitch, n)
-    dist = [[-1] * n for _ in range(n)]
-    parent: dict[tuple[int, int], tuple[int, int]] = {}
-    dist[start[0]][start[1]] = 0
-    queue: deque[tuple[int, int]] = deque([start])
-    while queue:
-        row, col = queue.popleft()
-        for nxt in _open_neighbors(row, col, h_state, v_state, n):
-            if dist[nxt[0]][nxt[1]] >= 0:
-                continue
-            dist[nxt[0]][nxt[1]] = dist[row][col] + 1
-            parent[nxt] = (row, col)
-            queue.append(nxt)
-    if dist[goal[0]][goal[1]] >= 0:
-        target = goal
-    else:
-        # An unknown door on the cell we are standing in must not outrank a
-        # corridor we can already walk. That stall is how the robot freezes.
-        target = _best_frontier(
-            dist, h_state, v_state, goal, parent, start, heading_xy, n, exclude=start
-        )
-        if target is None:
-            return _peek_unknown(robot_xy, start, h_state, v_state, goal, rejected, origin_xy, pitch, n)
-    cells = _reconstruct(parent, target, start, n)[: _ONLINE_MAX_CELLS + 1]
-    # A two-cell step through a corner is a diagonal the body cannot take.
-    # Stop on the corner cell; the next issue continues down the new hall.
-    if len(cells) >= 3:
-        first = (cells[1][0] - cells[0][0], cells[1][1] - cells[0][1])
-        second = (cells[2][0] - cells[1][0], cells[2][1] - cells[1][1])
-        if first != second:
-            cells = cells[:2]
-    centres = [_cell_center(row, col, robot_xy.device, origin_xy, pitch) for row, col in cells[1:]]
-    if not centres:
-        return robot_xy.unsqueeze(0)
-    return torch.stack((robot_xy, *centres), dim=0)
-
-
-def _door_states(
-    grid: OccupancyGrid,
-    env_index: int,
-    origin_xy: torch.Tensor,
-    pitch: float,
-    n: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Doorway labels, ``0`` unknown, ``1`` open, ``2`` wall.
-
-    ``horizontal[row, col]`` separates cells ``(row, col)`` and ``(row, col + 1)``.
-    ``vertical[row, col]`` separates ``(row, col)`` and ``(row + 1, col)``.
-    ``origin_xy`` is the world XY [m] of cell ``(0, 0)`` and ``pitch`` is the
-    corridor pitch [m].
-    """
-    device = grid.counts.device
-    ox = float(origin_xy[0])
-    oy = float(origin_xy[1])
-    rows = torch.arange(n, device=device)
-    cols = torch.arange(n - 1, device=device)
-    rr, cc = torch.meshgrid(rows, cols, indexing="ij")
-    x = ox + pitch * (cc.to(torch.float32) + 0.5)
-    y = oy + pitch * rr.to(torch.float32)
-    horizontal = _classify_opening(grid, env_index, x, y, along_x=False)
-    rows = torch.arange(n - 1, device=device)
-    cols = torch.arange(n, device=device)
-    rr, cc = torch.meshgrid(rows, cols, indexing="ij")
-    x = ox + pitch * cc.to(torch.float32)
-    y = oy + pitch * (rr.to(torch.float32) + 0.5)
-    vertical = _classify_opening(grid, env_index, x, y, along_x=True)
-    return horizontal, vertical
-
-
-def _classify_opening(
-    grid: OccupancyGrid,
-    env_index: int,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    *,
-    along_x: bool,
-) -> torch.Tensor:
-    """Label each doorway from samples across its opening."""
-    across = torch.tensor(_DOOR_ACROSS_M, device=x.device, dtype=x.dtype)
-    through = torch.tensor(_DOOR_THROUGH_M, device=x.device, dtype=x.dtype)
-    span = (across.numel(), through.numel(), *x.shape)
-    across_off = across.view(-1, 1, 1, 1)
-    through_off = through.view(1, -1, 1, 1)
-    # Dim 0 runs across the opening. Dim 1 runs through the wall slab.
-    if along_x:
-        xs = (x.view(1, 1, *x.shape) + across_off).expand(span)
-        ys = (y.view(1, 1, *y.shape) + through_off).expand(span)
-    else:
-        xs = (x.view(1, 1, *x.shape) + through_off).expand(span)
-        ys = (y.view(1, 1, *y.shape) + across_off).expand(span)
-    classes = _point_class(grid, env_index, torch.stack((xs, ys), dim=-1))
-    # One corner hit must not seal a 2 m opening. A real wall fills the slab.
-    wall_count = classes.eq(_WALL).sum(dim=(0, 1))
-    is_wall = wall_count >= 4
-    free_count = classes.eq(_FREE).sum(dim=(0, 1))
-    center_free = classes[len(_DOOR_ACROSS_M) // 2, len(_DOOR_THROUGH_M) // 2].eq(_FREE)
-    state = torch.zeros(x.shape, dtype=torch.long, device=x.device)
-    state = torch.where(center_free & ~is_wall & (free_count >= 3), torch.ones_like(state), state)
-    return torch.where(is_wall, torch.full_like(state, _WALL), state)
-
-
-def _point_class(grid: OccupancyGrid, env_index: int, pts: torch.Tensor) -> torch.Tensor:
-    """``0`` unknown, ``1`` free, ``2`` wall for world points ``(..., 2)`` [m]."""
-    origin = grid.origin[env_index]
-    res = grid.res[env_index].clamp(min=1e-6)
-    rel = (pts - origin) / res
-    inside = rel.abs().amax(dim=-1) < float(grid._half)
-    cell = torch.floor(rel).to(torch.long) + grid._half
-    cell = cell.clamp(0, grid.size - 1)
-    walls = grid.counts[env_index, cell[..., 0], cell[..., 1]] >= grid.hit_threshold
-    free = grid.free_counts[env_index, cell[..., 0], cell[..., 1]] > 0
-    classes = torch.zeros(pts.shape[:-1], dtype=torch.long, device=pts.device)
-    classes = torch.where(free, torch.ones_like(classes), classes)
-    classes = torch.where(walls, torch.full_like(classes, _WALL), classes)
-    return torch.where(inside, classes, torch.zeros_like(classes))
-
-
-def _maze_cell(xy: torch.Tensor, origin_xy: torch.Tensor, pitch: float, n: int) -> tuple[int, int]:
-    """Nearest maze cell ``(row, col)`` of a world point. Row follows ``y``."""
-    col = int(math.floor((float(xy[0]) - float(origin_xy[0])) / pitch + 0.5))
-    row = int(math.floor((float(xy[1]) - float(origin_xy[1])) / pitch + 0.5))
-    return (max(0, min(n - 1, row)), max(0, min(n - 1, col)))
-
-
-def _cell_center(
-    row: int, col: int, device: torch.device, origin_xy: torch.Tensor, pitch: float
-) -> torch.Tensor:
-    """World XY [m] of corridor cell ``(row, col)``."""
-    return torch.tensor(
-        (
-            float(origin_xy[0]) + pitch * col,
-            float(origin_xy[1]) + pitch * row,
-        ),
-        device=device,
-        dtype=torch.float32,
-    )
-
-
-def _open_neighbors(
-    row: int,
-    col: int,
-    horizontal: list[list[int]],
-    vertical: list[list[int]],
-    n: int,
-) -> list[tuple[int, int]]:
-    """Cells joined to ``(row, col)`` by an open doorway."""
-    found: list[tuple[int, int]] = []
-    if col + 1 < n and horizontal[row][col] == _FREE:
-        found.append((row, col + 1))
-    if col - 1 >= 0 and horizontal[row][col - 1] == _FREE:
-        found.append((row, col - 1))
-    if row + 1 < n and vertical[row][col] == _FREE:
-        found.append((row + 1, col))
-    if row - 1 >= 0 and vertical[row - 1][col] == _FREE:
-        found.append((row - 1, col))
-    return found
-
-
-def _unknown_neighbors(
-    row: int,
-    col: int,
-    horizontal: list[list[int]],
-    vertical: list[list[int]],
-    n: int,
-) -> list[tuple[int, int]]:
-    """In-grid neighbours whose doorway has not been classified."""
-    found: list[tuple[int, int]] = []
-    if col + 1 < n and horizontal[row][col] == _UNKNOWN:
-        found.append((row, col + 1))
-    if col - 1 >= 0 and horizontal[row][col - 1] == _UNKNOWN:
-        found.append((row, col - 1))
-    if row + 1 < n and vertical[row][col] == _UNKNOWN:
-        found.append((row + 1, col))
-    if row - 1 >= 0 and vertical[row - 1][col] == _UNKNOWN:
-        found.append((row - 1, col))
-    return found
-
-
-def _best_frontier(
-    dist: list[list[int]],
-    horizontal: list[list[int]],
-    vertical: list[list[int]],
-    goal: tuple[int, int],
-    parent: dict[tuple[int, int], tuple[int, int]],
-    start: tuple[int, int],
     heading_xy: torch.Tensor | None,
-    n: int,
-    exclude: tuple[int, int] | None = None,
-) -> tuple[int, int] | None:
-    """Reached cell that minimises known steps plus octile steps to the goal.
-
-    ``exclude`` is the robot's cell. An unknown door there is not a place we
-    can walk yet, so it must not beat a frontier further along an open hall.
-    A first step behind the robot costs four extra cells, so a side pocket
-    does not win while the corridor ahead is still open.
-    """
-    best: tuple[int, int] | None = None
-    best_key: tuple[float, int] | None = None
-    for row in range(n):
-        for col in range(n):
-            if dist[row][col] < 0 or (row, col) == exclude:
-                continue
-            if not _unknown_neighbors(row, col, horizontal, vertical, n):
-                continue
-            score = dist[row][col] + _octile_cells(row, col, goal[0], goal[1])
-            if _reverses(parent, (row, col), start, heading_xy, n):
-                score += 4.0
-            key = (score, -dist[row][col])
-            if best_key is None or key < best_key:
-                best_key = key
-                best = (row, col)
-    return best
-
-
-def _reverses(
-    parent: dict[tuple[int, int], tuple[int, int]],
-    target: tuple[int, int],
-    start: tuple[int, int],
-    heading_xy: torch.Tensor | None,
-    n: int,
-) -> bool:
-    """True when the first step from ``start`` toward ``target`` is behind the robot."""
-    if heading_xy is None:
-        return False
-    cell = target
-    guard = 0
-    while parent.get(cell) != start and guard < n * n:
-        nxt = parent.get(cell)
-        if nxt is None:
-            return False
-        cell = nxt
-        guard += 1
-    if parent.get(cell) != start:
-        return False
-    drow = cell[0] - start[0]
-    dcol = cell[1] - start[1]
-    return dcol * float(heading_xy[0]) + drow * float(heading_xy[1]) < -0.3
-
-
-def _peek_unknown(
-    robot_xy: torch.Tensor,
-    start: tuple[int, int],
-    horizontal: list[list[int]],
-    vertical: list[list[int]],
-    goal: tuple[int, int],
-    rejected: set[tuple[tuple[int, int], tuple[int, int]]],
-    origin_xy: torch.Tensor,
-    pitch: float,
-    n: int,
-) -> torch.Tensor:
-    """Step toward an unknown door, short of the wall, to classify it.
-
-    A door the robot is already standing in front of is remembered as rejected
-    so the next call looks down a different opening.
-    """
-    candidates = [
-        cell
-        for cell in _unknown_neighbors(start[0], start[1], horizontal, vertical, n)
-        if (start, cell) not in rejected
-    ]
-    while candidates:
-        best = min(candidates, key=lambda cell: _octile_cells(cell[0], cell[1], goal[0], goal[1]))
-        here = _cell_center(start[0], start[1], robot_xy.device, origin_xy, pitch)
-        there = _cell_center(best[0], best[1], robot_xy.device, origin_xy, pitch)
-        delta = there - here
-        length = torch.linalg.norm(delta)
-        if float(length) < 1e-3:
-            rejected.add((start, best))
-            candidates.remove(best)
-            continue
-        peek = here + delta / length * _PEEK_M
-        if float(torch.linalg.norm(robot_xy - peek)) < 0.5:
-            rejected.add((start, best))
-            candidates.remove(best)
-            continue
-        return torch.stack((robot_xy, peek), dim=0)
-    return robot_xy.unsqueeze(0)
-
-
-def _reconstruct(
-    parent: dict[tuple[int, int], tuple[int, int]],
-    target: tuple[int, int],
-    start: tuple[int, int],
-    n: int,
-) -> list[tuple[int, int]]:
-    """Cells from ``start`` to ``target``, inclusive."""
-    cells = [target]
-    guard = 0
-    while cells[-1] != start and guard < n * n:
-        cells.append(parent[cells[-1]])
-        guard += 1
-    cells.reverse()
-    return cells
-
-
-def _octile_cells(row: int, col: int, goal_row: int, goal_col: int) -> float:
-    """Octile distance in maze cells."""
-    dr = abs(row - goal_row)
-    dc = abs(col - goal_col)
-    diag = min(dr, dc)
-    return diag * math.sqrt(2.0) + (dr + dc - 2 * diag)
-
-
-def _world_to_coarse_cell(
-    xy: torch.Tensor,
     origin: torch.Tensor,
-    fine_res: float,
-    fine_half: int,
+    res: float,
+    half: int,
+    r0: int,
+    c0: int,
     factor: int,
-    shape: tuple[int, int],
-) -> tuple[int, int]:
-    """Map world XY to a coarsened cell. Row is x, matching the occupancy grid."""
-    rel = (xy - origin) / fine_res
-    fine_row = int(torch.floor(rel[0]).item()) + fine_half
-    fine_col = int(torch.floor(rel[1]).item()) + fine_half
-    row = fine_row // factor
-    col = fine_col // factor
-    row = max(0, min(shape[0] - 1, row))
-    col = max(0, min(shape[1] - 1, col))
-    return row, col
+    coarse_res: float,
+) -> torch.Tensor:
+    """Add the reverse penalty once, on the ring of cells just behind the robot."""
+    if heading_xy is None:
+        return step
+    heading = heading_xy.to(dtype=torch.float32)
+    norm = torch.linalg.norm(heading)
+    if float(norm) < 1e-6:
+        return step
+    heading = heading / norm
+    height, width = step.shape
+    rows = torch.arange(height, device=step.device)
+    cols = torch.arange(width, device=step.device)
+    fine_r = r0 + rows * factor + factor // 2
+    fine_c = c0 + cols * factor + factor // 2
+    xs = (fine_r.to(torch.float32) - half + 0.5) * res + float(origin[0])
+    ys = (fine_c.to(torch.float32) - half + 0.5) * res + float(origin[1])
+    rel_x = xs.view(-1, 1) - float(robot_xy[0])
+    rel_y = ys.view(1, -1) - float(robot_xy[1])
+    dist = torch.sqrt(rel_x**2 + rel_y**2).clamp(min=1e-6)
+    forward = rel_x * float(heading[0]) + rel_y * float(heading[1])
+    ring = (forward < -0.3 * dist) & (dist > 0.3) & (dist < 1.5)
+    return step + ring.to(step.dtype) * (_REVERSE_PENALTY_M / max(coarse_res, 1e-6))
+
+
+def _seen_prefix(local: torch.Tensor, seen: torch.Tensor) -> torch.Tensor:
+    """Cells from the start through the last seen cell. The start is always kept."""
+    height, width = seen.shape
+    keep = 1
+    for index in range(local.shape[0]):
+        row = int(local[index, 0])
+        col = int(local[index, 1])
+        if row < 0 or col < 0 or row >= height or col >= width:
+            break
+        if index > 0 and not bool(seen[row, col]):
+            break
+        keep = index + 1
+    return local[:keep]
+
+
+def _cells_to_world(field: dict, local: torch.Tensor) -> torch.Tensor:
+    """World XY [m] of coarse cell centres."""
+    factor = int(field["factor"])
+    res = float(field["res"])
+    half = int(field["half"])
+    origin = field["origin"]
+    fine_r = int(field["r0"]) + local[:, 0].to(torch.float32) * factor + factor // 2
+    fine_c = int(field["c0"]) + local[:, 1].to(torch.float32) * factor + factor // 2
+    xy = torch.stack(
+        (
+            (fine_r - half + 0.5) * res + float(origin[0]),
+            (fine_c - half + 0.5) * res + float(origin[1]),
+        ),
+        dim=-1,
+    )
+    return xy
+
+
+def _drop_backtrack(points: torch.Tensor) -> torch.Tensor:
+    """Drop a vertex that sits on the previous one."""
+    if points.shape[0] < 2:
+        return points
+    keep = [0]
+    for index in range(1, points.shape[0]):
+        if float(torch.linalg.norm(points[index] - points[keep[-1]])) > 1e-3:
+            keep.append(index)
+    return points[keep]
+
+
+def _simplify_polyline(points: torch.Tensor, epsilon: float) -> torch.Tensor:
+    """Ramer-Douglas-Peucker. Drops cell-scale jogs, keeps corridor corners."""
+    count = int(points.shape[0])
+    if count < 3:
+        return points
+    keep = torch.zeros(count, dtype=torch.bool, device=points.device)
+    keep[0] = True
+    keep[-1] = True
+    stack = [(0, count - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        segment = points[end] - points[start]
+        length = torch.linalg.norm(segment).clamp(min=1e-8)
+        rel = points[start + 1 : end] - points[start]
+        cross = (rel[:, 0] * segment[1] - rel[:, 1] * segment[0]).abs() / length
+        offset = int(torch.argmax(cross).item())
+        if float(cross[offset]) > epsilon:
+            chosen = start + 1 + offset
+            keep[chosen] = True
+            stack.append((start, chosen))
+            stack.append((chosen, end))
+    return points[keep]
+
+
+def _cut_turn(points: torch.Tensor, min_m: float, turn_rad: float) -> tuple[torch.Tensor, bool]:
+    """End the prefix at the first sharp corner beyond ``min_m`` [m].
+
+    The bool is true when a corner was cut, so the caller can stop short of
+    that vertex.
+    """
+    if points.shape[0] < 3:
+        return points, False
+    cum = cumulative_length(points)
+    limit = math.cos(turn_rad)
+    for index in range(1, points.shape[0] - 1):
+        if float(cum[index]) < min_m:
+            continue
+        incoming = points[index] - points[index - 1]
+        outgoing = points[index + 1] - points[index]
+        length_in = float(torch.linalg.norm(incoming))
+        length_out = float(torch.linalg.norm(outgoing))
+        if length_in < 1e-4 or length_out < 1e-4:
+            continue
+        cosine = float(torch.dot(incoming, outgoing) / (length_in * length_out))
+        if cosine < limit:
+            return points[: index + 1], True
+    return points, False
+
+
+def _shorten_end(points: torch.Tensor, backoff_m: float, min_m: float) -> torch.Tensor:
+    """Drop the last ``backoff_m`` [m] unless that would leave less than ``min_m``."""
+    if points.shape[0] < 2:
+        return points
+    length = float(cumulative_length(points)[-1])
+    target = length - backoff_m
+    if target < min_m:
+        return points
+    return _cap_length(points, target)
+
+
+def _cap_length(points: torch.Tensor, max_m: float) -> torch.Tensor:
+    """Cut ``points`` at arc length ``max_m`` [m]."""
+    if points.shape[0] < 2:
+        return points
+    cum = cumulative_length(points)
+    if float(cum[-1]) <= max_m:
+        return points
+    end = point_at_distance(points, max_m)
+    before = int((cum < max_m - 1e-4).sum().item())
+    before = max(1, min(before, points.shape[0]))
+    kept = points[:before]
+    if float(torch.linalg.norm(kept[-1] - end)) > 1e-3:
+        kept = torch.cat((kept, end.unsqueeze(0)), dim=0)
+    return kept
 
 
 def _coarsen(
@@ -662,9 +761,10 @@ def _coarsen(
     if dst_res <= src_res * 1.01:
         return occupied, unknown, 1
     factor = max(1, int(round(dst_res / src_res)))
-    edge = occupied.shape[0] - (occupied.shape[0] % factor)
-    occ = occupied[:edge, :edge].reshape(edge // factor, factor, edge // factor, factor).any(dim=(1, 3))
-    unk = unknown[:edge, :edge].reshape(edge // factor, factor, edge // factor, factor).all(dim=(1, 3))
+    edge_h = occupied.shape[0] - (occupied.shape[0] % factor)
+    edge_w = occupied.shape[1] - (occupied.shape[1] % factor)
+    occ = occupied[:edge_h, :edge_w].reshape(edge_h // factor, factor, edge_w // factor, factor).any(dim=(1, 3))
+    unk = unknown[:edge_h, :edge_w].reshape(edge_h // factor, factor, edge_w // factor, factor).all(dim=(1, 3))
     return occ, unk, factor
 
 

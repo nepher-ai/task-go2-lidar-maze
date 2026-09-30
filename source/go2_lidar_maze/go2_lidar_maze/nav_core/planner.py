@@ -347,6 +347,173 @@ def trace_route(
     return route
 
 
+@torch.no_grad()
+def distance_field_batch(
+    occupied: torch.Tensor,
+    goal: torch.Tensor,
+    resolution: float | torch.Tensor,
+    step_cost: torch.Tensor | None = None,
+    robot: torch.Tensor | None = None,
+    max_iters: int = 512,
+    check_every: int = 8,
+) -> torch.Tensor:
+    """Shortest-path distance to the goal on a batch of occupancy grids.
+
+    Same costs as :func:`distance_field`: cardinal steps cost the cell size
+    times ``step_cost``, diagonals cost ``sqrt(2)`` times that, and a diagonal
+    is refused when either side cell is a wall. The sweep stops once every
+    grid has stopped changing, which is when each robot cell's distance has
+    settled. One sealed environment does not keep the others iterating.
+
+    Args:
+        occupied: Boolean wall mask ``(B, H, W)``.
+        goal: Goal cells ``(B, 2)`` as ``(row, col)``.
+        resolution: Cell size [m], a float or ``(B,)``.
+        step_cost: Per-cell multiplier ``(B, H, W)``, at least 1. Defaults to 1.
+        robot: Optional robot cells ``(B, 2)``. The goal and these cells are
+            forced traversable so inflation cannot strand the plan.
+        max_iters: Relaxation sweeps. Also the longest route, in cells, that
+            the field can represent.
+        check_every: Sweeps between convergence checks.
+
+    Returns:
+        Distance to the goal [m], shape ``(B, H, W)``. Cells with no route are
+        ``UNREACHABLE``.
+    """
+    if occupied.ndim != 3:
+        raise ValueError(f"distance_field_batch expects (B, H, W), got {tuple(occupied.shape)}.")
+    batch, height, width = occupied.shape
+    device = occupied.device
+    goal = goal.to(device=device, dtype=torch.long)
+    env = torch.arange(batch, device=device)
+    goal_r = goal[:, 0].clamp(0, height - 1)
+    goal_c = goal[:, 1].clamp(0, width - 1)
+    free = ~occupied
+    free[env, goal_r, goal_c] = True
+    if robot is not None:
+        robot = robot.to(device=device, dtype=torch.long)
+        free[env, robot[:, 0].clamp(0, height - 1), robot[:, 1].clamp(0, width - 1)] = True
+    wall = ~free
+    if step_cost is None:
+        mult = torch.ones((batch, height, width), dtype=torch.float32, device=device)
+    else:
+        mult = step_cost.to(dtype=torch.float32, device=device).clamp(min=1.0)
+    if isinstance(resolution, torch.Tensor):
+        res = resolution.to(device=device, dtype=torch.float32).reshape(batch, 1, 1)
+    else:
+        res = torch.full((batch, 1, 1), float(resolution), device=device)
+    cardinal = res * mult
+    diagonal = cardinal * math.sqrt(2.0)
+    blocked_cost = torch.full((batch, height, width), UNREACHABLE, dtype=torch.float32, device=device)
+    dist = blocked_cost.clone()
+    dist[env, goal_r, goal_c] = 0.0
+
+    previous = dist.clone()
+    quiet = torch.zeros(batch, dtype=torch.long, device=device)
+    for it in range(max_iters):
+        base = dist
+        updated = base
+        for dr, dc in CARDINAL:
+            updated = torch.minimum(updated, _shift(base, dr, dc, UNREACHABLE) + cardinal)
+        for dr, dc in OCTILE[4:]:
+            neigh = _shift(base, dr, dc, UNREACHABLE)
+            side_a = _shift(wall, dr, 0, True)
+            side_b = _shift(wall, 0, dc, True)
+            cand = torch.where(side_a | side_b, blocked_cost, neigh + diagonal)
+            updated = torch.minimum(updated, cand)
+        dist = torch.where(free, updated, blocked_cost)
+        dist[env, goal_r, goal_c] = 0.0
+        if (it + 1) % check_every == 0:
+            change = (dist - previous).abs().amax(dim=(1, 2))
+            quiet = torch.where(change < 1.0e-3, quiet + 1, torch.zeros_like(quiet))
+            previous = dist.clone()
+            if int(quiet.min()) >= 2:
+                break
+    return dist
+
+
+@torch.no_grad()
+def trace_route_batch(
+    dist: torch.Tensor,
+    start: torch.Tensor,
+    *,
+    resolution: float | torch.Tensor,
+    max_length_m: float = 16.0,
+    max_steps: int = 96,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Walk downhill on each distance field.
+
+    Args:
+        dist: Distance-to-goal ``(B, H, W)`` [m] from :func:`distance_field_batch`.
+        start: Robot cells ``(B, 2)`` as ``(row, col)``.
+        resolution: Cell size [m], a float or ``(B,)``.
+        max_length_m: Arc length at which a walk stops [m].
+        max_steps: Most cells to visit after the start.
+
+    Returns:
+        ``(cells, counts)``. ``cells`` is ``(B, max_steps + 1, 2)`` and starts
+        at ``start``. ``counts`` is ``(B,)``, the number of cells in each walk
+        including the start. Cells past ``counts`` repeat the last step.
+    """
+    batch, height, width = dist.shape
+    device = dist.device
+    offsets = torch.tensor(OCTILE, dtype=torch.long, device=device)
+    diagonal = (offsets[:, 0] != 0) & (offsets[:, 1] != 0)
+    side_a_off = torch.stack((offsets[:, 0], torch.zeros_like(offsets[:, 0])), dim=-1)
+    side_b_off = torch.stack((torch.zeros_like(offsets[:, 1]), offsets[:, 1]), dim=-1)
+    cur = start.to(device=device, dtype=torch.long).reshape(batch, 2).clone()
+    cur[:, 0].clamp_(0, height - 1)
+    cur[:, 1].clamp_(0, width - 1)
+    cells = cur.new_empty((batch, max_steps + 1, 2))
+    cells[:, 0] = cur
+    counts = torch.ones(batch, dtype=torch.long, device=device)
+    travelled = torch.zeros(batch, dtype=torch.float32, device=device)
+    alive = torch.ones(batch, dtype=torch.bool, device=device)
+    if isinstance(resolution, torch.Tensor):
+        res = resolution.to(device=device, dtype=torch.float32).reshape(batch)
+    else:
+        res = torch.full((batch,), float(resolution), device=device)
+    env = torch.arange(batch, device=device)
+
+    def _sample(query: torch.Tensor) -> torch.Tensor:
+        inside = (
+            (query[..., 0] >= 0)
+            & (query[..., 0] < height)
+            & (query[..., 1] >= 0)
+            & (query[..., 1] < width)
+        )
+        clamped = query.clamp(min=0).clone()
+        clamped[..., 0].clamp_(max=height - 1)
+        clamped[..., 1].clamp_(max=width - 1)
+        index = env.view(batch, *([1] * (query.dim() - 2))).expand_as(clamped[..., 0])
+        vals = dist[index, clamped[..., 0], clamped[..., 1]]
+        return torch.where(inside, vals, torch.full_like(vals, UNREACHABLE))
+
+    for step in range(max_steps):
+        if not bool(alive.any()):
+            cells[:, step + 1] = cur
+            continue
+        cand = cur.unsqueeze(1) + offsets.unsqueeze(0)
+        vals = _sample(cand)
+        corner = diagonal.view(1, -1) & (
+            (_sample(cur.unsqueeze(1) + side_a_off.unsqueeze(0)) >= UNREACHABLE * 0.5)
+            | (_sample(cur.unsqueeze(1) + side_b_off.unsqueeze(0)) >= UNREACHABLE * 0.5)
+        )
+        vals = vals.masked_fill(corner, UNREACHABLE)
+        best = torch.argmin(vals, dim=1)
+        nxt = cand[env, best]
+        inside = (nxt[:, 0] >= 0) & (nxt[:, 0] < height) & (nxt[:, 1] >= 0) & (nxt[:, 1] < width)
+        cur_val = dist[env, cur[:, 0], cur[:, 1]]
+        improves = (vals[env, best] < cur_val - 1.0e-4) & inside & alive
+        step_len = torch.linalg.norm((nxt - cur).to(torch.float32), dim=-1) * res
+        travelled = travelled + torch.where(improves, step_len, torch.zeros_like(step_len))
+        cur = torch.where(improves.unsqueeze(1), nxt, cur)
+        cells[:, step + 1] = cur
+        counts = counts + improves.to(torch.long)
+        alive = alive & improves & (travelled < max_length_m)
+    return cells, counts
+
+
 def path_length_m(path: Sequence[tuple[int, int]], resolution: float) -> float:
     """Geometric length of an 8-connected cell path [m]."""
     total = 0.0

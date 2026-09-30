@@ -90,13 +90,7 @@ class WaypointCommand(CommandTerm):
         self._layout = None
         self._stack: NavigationStack | None = None
         if cfg.source == "online":
-            self._stack = NavigationStack(
-                self.num_envs,
-                self.device,
-                cell_origin_xy=getattr(env, "maze_cell_origin_xy", None),
-                cell_pitch=getattr(env, "maze_cell_pitch", None),
-                grid_n=getattr(env, "maze_grid_n", None),
-            )
+            self._stack = NavigationStack(self.num_envs, self.device)
         self.metrics["waypoint_success"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
@@ -168,43 +162,36 @@ class WaypointCommand(CommandTerm):
         )
         self._stack.update(hits, ray_origin_w(sensor))
         robot_xy = self.robot.data.root_pos_w.torch[:, :2]
-        # One batched wall test for every robot. Replanning stays per environment,
-        # and only for a robot whose route is blocked or whose reached plan is due.
+        headings = _headings(self)
+        # One batched wall test. A route that stays blocked used to rebuild the
+        # distance field for every robot on every control step, and the episode
+        # never reached its summary print. Rebuild on the first scan, then at
+        # the field interval.
         blocked = self._stack.blocked_routes(robot_xy, self.waypoint_w)
+        due = self._stack.field_due()
+        refresh = ~self._stack.field_ready | (blocked & due)
         latched = self.bonus_paid & (self._stack._age >= 10)
-        repair = (~self.bonus_paid) & blocked
-        if not bool(latched.any() or repair.any()):
+        repair = (~self.bonus_paid) & blocked & due
+        self._stack.refresh_fields(refresh, robot_xy, headings)
+        need = latched | repair
+        if not bool(need.any()):
             return
-        for index in latched.nonzero(as_tuple=False).flatten().tolist():
-            # The last plan was already reached (usually the robot's own
-            # cell). Look again once a second in case a door has cleared.
-            self._stack.invalidate(index)
-            waypoint, path, _length = self._stack.plan_waypoint(
-                index, robot_xy[index], force=True, heading_xy=_heading(self, index)
-            )
-            if float(torch.linalg.norm(waypoint - robot_xy[index])) < REACH_RADIUS_M:
+        self._stack.plan_mask(need, robot_xy, headings)
+        for index in need.nonzero(as_tuple=False).flatten().tolist():
+            waypoint = self._stack.planned_xy[index]
+            waiting = float(torch.linalg.norm(waypoint - robot_xy[index])) < REACH_RADIUS_M
+            # The scan has not opened a route yet. Burning the waypoint budget
+            # here ends the episode before the map exists.
+            if bool(latched[index]) and waiting:
+                self.time_on_waypoint[index] = 0.0
                 continue
+            old = self.waypoint_w[index]
+            moved = float(torch.linalg.norm(waypoint - old))
             self.waypoint_w[index] = waypoint
-            self._write_online_path(index, path)
-            self.s_bar[index] = 0.0
-            self.time_on_waypoint[index] = 0.0
-            self.bonus_paid[index] = False
-            self.issued_count[index] += 1.0
-            goal_dist = torch.linalg.norm(waypoint - self._env.goal_xy[index])
-            self.is_final[index] = bool(goal_dist < 0.3)
-            length = self.path_length[index].clamp(min=CELL_PITCH_M)
-            self.time_budget[index] = (length / 0.5 + 5.0).clamp(10.0, 30.0)
-        for index in repair.nonzero(as_tuple=False).flatten().tolist():
-            old = self.waypoint_w[index].clone()
-            self._stack.invalidate(index)
-            waypoint, path, _length = self._stack.plan_waypoint(
-                index, robot_xy[index], force=True, heading_xy=_heading(self, index)
-            )
-            self.waypoint_w[index] = waypoint
-            self._write_online_path(index, path)
+            self._write_online_path(index, self._stack.path_of(index))
             # A wall that only grazes the route replans to the same point.
             # Resetting the timer there makes the waypoint thrash.
-            if float(torch.linalg.norm(waypoint - old)) > 0.3:
+            if bool(latched[index]) or moved > 0.3:
                 self.s_bar[index] = 0.0
                 self.time_on_waypoint[index] = 0.0
                 self.bonus_paid[index] = False
@@ -213,6 +200,8 @@ class WaypointCommand(CommandTerm):
                 self.is_final[index] = bool(goal_dist < 0.3)
                 length = self.path_length[index].clamp(min=CELL_PITCH_M)
                 self.time_budget[index] = (length / 0.5 + 5.0).clamp(10.0, 30.0)
+            if waiting:
+                self.time_on_waypoint[index] = 0.0
 
     def _issue(self, env_ids: Sequence[int]):
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
@@ -247,12 +236,14 @@ class WaypointCommand(CommandTerm):
     def _issue_online(self, ids: torch.Tensor):
         robot_xy = self.robot.data.root_pos_w.torch[:, :2]
         goal_xy = self._env.goal_xy
+        mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        mask[ids] = True
+        self._stack.field_ready[ids] = False
+        self._stack.plan_mask(mask, robot_xy, _headings(self))
         for index in ids.tolist():
-            waypoint, path, _length = self._stack.plan_waypoint(
-                index, robot_xy[index], force=True, heading_xy=_heading(self, index)
-            )
+            waypoint = self._stack.planned_xy[index]
             self.waypoint_w[index] = waypoint
-            self._write_online_path(index, path)
+            self._write_online_path(index, self._stack.path_of(index))
             goal_dist = torch.linalg.norm(waypoint - goal_xy[index])
             self.is_final[index] = bool(goal_dist < 0.3)
 
@@ -321,10 +312,10 @@ def _yaw(quat_xyzw: torch.Tensor) -> torch.Tensor:
     return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
-def _heading(command: WaypointCommand, index: int) -> torch.Tensor:
-    """Planar heading of one robot, as a unit vector in world XY."""
-    yaw = _yaw(command.robot.data.root_quat_w.torch[index])
-    return torch.stack((torch.cos(yaw), torch.sin(yaw)))
+def _headings(command: WaypointCommand) -> torch.Tensor:
+    """Planar heading of every robot, as a unit vector in world XY. Shape ``(N, 2)``."""
+    yaw = _yaw(command.robot.data.root_quat_w.torch)
+    return torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=-1)
 
 
 def _nearest_cell(xy: torch.Tensor) -> int:
