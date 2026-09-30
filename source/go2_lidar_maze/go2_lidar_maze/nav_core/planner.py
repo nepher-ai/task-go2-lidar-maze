@@ -301,12 +301,7 @@ def trace_route(
     rows = torch.zeros(1, dtype=torch.long, device=device)
 
     def _sample(cells: torch.Tensor) -> torch.Tensor:
-        inside = (
-            (cells[..., 0] >= 0)
-            & (cells[..., 0] < height)
-            & (cells[..., 1] >= 0)
-            & (cells[..., 1] < width)
-        )
+        inside = (cells[..., 0] >= 0) & (cells[..., 0] < height) & (cells[..., 1] >= 0) & (cells[..., 1] < width)
         clamped = cells.clamp(min=0)
         clamped[..., 0].clamp_(max=height - 1)
         clamped[..., 1].clamp_(max=width - 1)
@@ -326,9 +321,7 @@ def trace_route(
         best = torch.argmin(vals, dim=1)
         nxt = cand[rows, best]
         # Out-of-grid neighbours are not stored; skip them by holding position.
-        nxt_inside = (
-            (nxt[:, 0] >= 0) & (nxt[:, 0] < height) & (nxt[:, 1] >= 0) & (nxt[:, 1] < width)
-        )
+        nxt_inside = (nxt[:, 0] >= 0) & (nxt[:, 0] < height) & (nxt[:, 1] >= 0) & (nxt[:, 1] < width)
         cur_val = band[rows, cur[:, 0], cur[:, 1]]
         improves = (vals[rows, best] < cur_val - 1.0e-4) & nxt_inside
         cur = torch.where(improves.unsqueeze(1), nxt, cur)
@@ -361,9 +354,12 @@ def distance_field_batch(
 
     Same costs as :func:`distance_field`: cardinal steps cost the cell size
     times ``step_cost``, diagonals cost ``sqrt(2)`` times that, and a diagonal
-    is refused when either side cell is a wall. The sweep stops once every
-    grid has stopped changing, which is when each robot cell's distance has
-    settled. One sealed environment does not keep the others iterating.
+    is refused when either side cell is a wall. When ``robot`` is given, the
+    sweep stops once every robot cell has held its distance. If much of the
+    crop is unknown, it first waits long enough for a mapped corridor about
+    three times longer in cells than the first wave. One expensive cell, such
+    as the reverse ring, does not stretch that wait. Without ``robot``, the
+    sweep stops once every grid has stopped changing.
 
     Args:
         occupied: Boolean wall mask ``(B, H, W)``.
@@ -404,32 +400,108 @@ def distance_field_batch(
         res = torch.full((batch, 1, 1), float(resolution), device=device)
     cardinal = res * mult
     diagonal = cardinal * math.sqrt(2.0)
-    blocked_cost = torch.full((batch, height, width), UNREACHABLE, dtype=torch.float32, device=device)
-    dist = blocked_cost.clone()
+    dist = torch.full((batch, height, width), UNREACHABLE, dtype=torch.float32, device=device)
     dist[env, goal_r, goal_c] = 0.0
+    # One 3x3 step-cost stencil. The centre is 0, so the sweep keeps the
+    # current distance. A blocked diagonal costs UNREACHABLE: added to any
+    # finite neighbour it stays above every real route, and the centre cell
+    # is always a candidate, so the min matches refusing that step.
+    wall_pad = torch.nn.functional.pad(wall, (1, 1, 1, 1), value=True)
+    north_w = wall_pad[:, :-2, 1:-1]
+    south_w = wall_pad[:, 2:, 1:-1]
+    west_w = wall_pad[:, 1:-1, :-2]
+    east_w = wall_pad[:, 1:-1, 2:]
+    cost = diagonal.unsqueeze(-1).expand(batch, height, width, 9).clone().view(batch, height, width, 3, 3)
+    cost[..., 1, 1] = 0.0
+    cost[..., 0, 1] = cardinal
+    cost[..., 2, 1] = cardinal
+    cost[..., 1, 0] = cardinal
+    cost[..., 1, 2] = cardinal
+    cost[..., 0, 0].masked_fill_(north_w | west_w, UNREACHABLE)
+    cost[..., 0, 2].masked_fill_(north_w | east_w, UNREACHABLE)
+    cost[..., 2, 0].masked_fill_(south_w | west_w, UNREACHABLE)
+    cost[..., 2, 2].masked_fill_(south_w | east_w, UNREACHABLE)
+    dist_pad = torch.empty((batch, height + 2, width + 2), dtype=torch.float32, device=device)
+    dist_pad[:, 0, :] = UNREACHABLE
+    dist_pad[:, -1, :] = UNREACHABLE
+    dist_pad[:, :, 0] = UNREACHABLE
+    dist_pad[:, :, -1] = UNREACHABLE
 
-    previous = dist.clone()
+    # The first finite value is the shortest hop path, often through unknown
+    # cells. A cheaper corridor can be longer in hops by about that cost.
+    # A one-cell spike, such as the reverse ring, is not a longer route, so
+    # the wait follows how much of the crop actually carries the high cost.
+    hop_scale = 1
+    history = None
+    robot_r = robot_c = None
+    if robot is not None:
+        robot_r = robot[:, 0].clamp(0, height - 1)
+        robot_c = robot[:, 1].clamp(0, width - 1)
+        share = torch.stack(((mult >= 1.5).float().mean(), (mult >= 2.5).float().mean()))
+        mid_share, high_share = share.tolist()
+        if high_share > 0.01:
+            hop_scale = 3
+        elif mid_share > 0.01:
+            hop_scale = 2
+        history = torch.empty((max_iters, batch), dtype=torch.float32, device=device)
+    previous = None if robot is not None else dist.clone()
     quiet = torch.zeros(batch, dtype=torch.long, device=device)
+    arrived = torch.full((batch,), -1, dtype=torch.long, device=device)
     for it in range(max_iters):
-        base = dist
-        updated = base
-        for dr, dc in CARDINAL:
-            updated = torch.minimum(updated, _shift(base, dr, dc, UNREACHABLE) + cardinal)
-        for dr, dc in OCTILE[4:]:
-            neigh = _shift(base, dr, dc, UNREACHABLE)
-            side_a = _shift(wall, dr, 0, True)
-            side_b = _shift(wall, 0, dc, True)
-            cand = torch.where(side_a | side_b, blocked_cost, neigh + diagonal)
-            updated = torch.minimum(updated, cand)
-        dist = torch.where(free, updated, blocked_cost)
-        dist[env, goal_r, goal_c] = 0.0
-        if (it + 1) % check_every == 0:
+        dist_pad[:, 1:-1, 1:-1] = dist
+        windows = dist_pad.unfold(1, 3, 1).unfold(2, 3, 1)
+        updated = (windows + cost).amin(dim=(-2, -1))
+        updated.masked_fill_(~free, UNREACHABLE)
+        dist = updated
+        if history is not None:
+            history[it] = dist[env, robot_r, robot_c]
+        if (it + 1) % check_every != 0:
+            continue
+        if history is not None:
+            quiet, arrived = _robot_quiet(history[: it + 1], check_every, hop_scale, quiet, arrived)
+        else:
             change = (dist - previous).abs().amax(dim=(1, 2))
             quiet = torch.where(change < 1.0e-3, quiet + 1, torch.zeros_like(quiet))
             previous = dist.clone()
-            if int(quiet.min()) >= 2:
-                break
+        if int(quiet.min()) >= 2:
+            break
     return dist
+
+
+def _robot_quiet(
+    history: torch.Tensor,
+    check_every: int,
+    hop_scale: int,
+    quiet: torch.Tensor,
+    arrived: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Advance the robot-cell stop from the newest check in ``history``.
+
+    ``history`` holds the robot distance after every sweep so far, oldest
+    first. Only the rows at the check interval are compared, matching a
+    running check that samples every ``check_every`` sweeps.
+    """
+    end = history.shape[0] - 1
+    now = history[end]
+    if end >= check_every:
+        prev = history[end - check_every]
+        segment = history[end - check_every + 1 :]
+        start = end - check_every + 1
+    else:
+        prev = torch.full_like(now, UNREACHABLE)
+        segment = history
+        start = 0
+    finite_now = now < UNREACHABLE * 0.5
+    changed = (now - prev).abs() >= 1.0e-2
+    finite = segment < UNREACHABLE * 0.5
+    any_finite = finite.any(dim=0)
+    first = finite.to(torch.float32).argmax(dim=0)
+    step_no = (start + first + 1).to(dtype=arrived.dtype)
+    arrived = torch.where(any_finite & (arrived < 0), step_no, arrived)
+    waited = (arrived >= 0) & ((end + 1) >= arrived * hop_scale)
+    holding = finite_now & ~changed & waited
+    quiet = torch.where(holding, quiet + 1, torch.zeros_like(quiet))
+    return quiet, arrived
 
 
 @torch.no_grad()
@@ -457,61 +529,90 @@ def trace_route_batch(
     """
     batch, height, width = dist.shape
     device = dist.device
-    offsets = torch.tensor(OCTILE, dtype=torch.long, device=device)
-    diagonal = (offsets[:, 0] != 0) & (offsets[:, 1] != 0)
-    side_a_off = torch.stack((offsets[:, 0], torch.zeros_like(offsets[:, 0])), dim=-1)
-    side_b_off = torch.stack((torch.zeros_like(offsets[:, 1]), offsets[:, 1]), dim=-1)
+    if isinstance(resolution, torch.Tensor):
+        res = resolution.to(device=device, dtype=torch.float32).reshape(batch)
+    else:
+        res = torch.full((batch,), float(resolution), device=device)
     cur = start.to(device=device, dtype=torch.long).reshape(batch, 2).clone()
     cur[:, 0].clamp_(0, height - 1)
     cur[:, 1].clamp_(0, width - 1)
     cells = cur.new_empty((batch, max_steps + 1, 2))
     cells[:, 0] = cur
     counts = torch.ones(batch, dtype=torch.long, device=device)
-    travelled = torch.zeros(batch, dtype=torch.float32, device=device)
-    alive = torch.ones(batch, dtype=torch.bool, device=device)
-    if isinstance(resolution, torch.Tensor):
-        res = resolution.to(device=device, dtype=torch.float32).reshape(batch)
-    else:
-        res = torch.full((batch,), float(resolution), device=device)
+    if max_steps <= 0:
+        return cells, counts
+    # The best downhill step depends only on the field, so follow it instead of
+    # re-ranking the eight neighbours at every cell of the walk.
+    succ = _best_step(dist)
     env = torch.arange(batch, device=device)
-
-    def _sample(query: torch.Tensor) -> torch.Tensor:
-        inside = (
-            (query[..., 0] >= 0)
-            & (query[..., 0] < height)
-            & (query[..., 1] >= 0)
-            & (query[..., 1] < width)
-        )
-        clamped = query.clamp(min=0).clone()
-        clamped[..., 0].clamp_(max=height - 1)
-        clamped[..., 1].clamp_(max=width - 1)
-        index = env.view(batch, *([1] * (query.dim() - 2))).expand_as(clamped[..., 0])
-        vals = dist[index, clamped[..., 0], clamped[..., 1]]
-        return torch.where(inside, vals, torch.full_like(vals, UNREACHABLE))
-
-    for step in range(max_steps):
-        if not bool(alive.any()):
-            cells[:, step + 1] = cur
-            continue
-        cand = cur.unsqueeze(1) + offsets.unsqueeze(0)
-        vals = _sample(cand)
-        corner = diagonal.view(1, -1) & (
-            (_sample(cur.unsqueeze(1) + side_a_off.unsqueeze(0)) >= UNREACHABLE * 0.5)
-            | (_sample(cur.unsqueeze(1) + side_b_off.unsqueeze(0)) >= UNREACHABLE * 0.5)
-        )
-        vals = vals.masked_fill(corner, UNREACHABLE)
-        best = torch.argmin(vals, dim=1)
-        nxt = cand[env, best]
-        inside = (nxt[:, 0] >= 0) & (nxt[:, 0] < height) & (nxt[:, 1] >= 0) & (nxt[:, 1] < width)
-        cur_val = dist[env, cur[:, 0], cur[:, 1]]
-        improves = (vals[env, best] < cur_val - 1.0e-4) & inside & alive
-        step_len = torch.linalg.norm((nxt - cur).to(torch.float32), dim=-1) * res
-        travelled = travelled + torch.where(improves, step_len, torch.zeros_like(step_len))
-        cur = torch.where(improves.unsqueeze(1), nxt, cur)
-        cells[:, step + 1] = cur
-        counts = counts + improves.to(torch.long)
-        alive = alive & improves & (travelled < max_length_m)
+    for _step in range(max_steps):
+        cur = succ[env, cur[:, 0], cur[:, 1]]
+        cells[:, _step + 1] = cur
+    delta = (cells[:, 1:] - cells[:, :-1]).to(torch.float32)
+    step_len = torch.linalg.norm(delta, dim=-1) * res.unsqueeze(1)
+    moved = step_len > 1.0e-8
+    # A step counts only while every earlier step moved and stayed under the cap.
+    # The step that crosses ``max_length_m`` is kept; later ones are not.
+    prefix = torch.cumprod(moved.to(torch.int32), dim=1).to(dtype=torch.bool)
+    travelled = torch.cumsum(step_len, dim=1)
+    under = torch.ones_like(prefix)
+    under[:, 1:] = travelled[:, :-1] < max_length_m
+    keep = prefix & under
+    counts = counts + keep.sum(dim=1)
+    last = (counts - 1).view(batch, 1, 1).expand(batch, 1, 2)
+    held = cells.gather(1, last)
+    index = torch.arange(max_steps + 1, device=device).view(1, -1, 1)
+    cells = torch.where(index < counts.view(batch, 1, 1), cells, held)
     return cells, counts
+
+
+def _best_step(dist: torch.Tensor) -> torch.Tensor:
+    """Downhill neighbour of every cell, or the cell itself when none improves.
+
+    Neighbours are tried in :data:`OCTILE` order. A diagonal is refused when
+    either side cell is unreachable, and an out-of-grid neighbour is unreachable.
+    """
+    batch, height, width = dist.shape
+    device = dist.device
+    offsets = torch.tensor(OCTILE, dtype=torch.long, device=device)
+    rows = torch.arange(height, device=device)
+    cols = torch.arange(width, device=device)
+    cand_r = rows.view(1, -1, 1, 1) + offsets[:, 0].view(1, 1, 1, -1)
+    cand_c = cols.view(1, 1, -1, 1) + offsets[:, 1].view(1, 1, 1, -1)
+    cand_r = cand_r.expand(batch, height, width, 8)
+    cand_c = cand_c.expand(batch, height, width, 8)
+    inside = (cand_r >= 0) & (cand_r < height) & (cand_c >= 0) & (cand_c < width)
+    env = torch.arange(batch, device=device).view(batch, 1, 1, 1).expand(batch, height, width, 8)
+    vals = dist[env, cand_r.clamp(0, height - 1), cand_c.clamp(0, width - 1)]
+    vals = torch.where(inside, vals, torch.full_like(vals, UNREACHABLE))
+    diagonal = (offsets[:, 0] != 0) & (offsets[:, 1] != 0)
+    side_r = (rows.view(1, -1, 1, 1) + offsets[:, 0].view(1, 1, 1, -1)).expand(batch, height, width, 8)
+    side_c = cols.view(1, 1, -1, 1).expand(batch, height, width, 8)
+    side_b_r = rows.view(1, -1, 1, 1).expand(batch, height, width, 8)
+    side_b_c = (cols.view(1, 1, -1, 1) + offsets[:, 1].view(1, 1, 1, -1)).expand(batch, height, width, 8)
+
+    def _at(rr: torch.Tensor, cc: torch.Tensor) -> torch.Tensor:
+        ok = (rr >= 0) & (rr < height) & (cc >= 0) & (cc < width)
+        sampled = dist[env, rr.clamp(0, height - 1), cc.clamp(0, width - 1)]
+        return torch.where(ok, sampled, torch.full_like(sampled, UNREACHABLE))
+
+    blocked = (_at(side_r, side_c) >= UNREACHABLE * 0.5) | (_at(side_b_r, side_b_c) >= UNREACHABLE * 0.5)
+    vals = vals.masked_fill(diagonal.view(1, 1, 1, -1) & blocked, UNREACHABLE)
+    improves = vals < dist.unsqueeze(-1) - 1.0e-4
+    best = vals.masked_fill(~improves, float("inf")).argmin(dim=-1)
+    pick = best.unsqueeze(-1)
+    next_r = cand_r.gather(-1, pick).squeeze(-1)
+    next_c = cand_c.gather(-1, pick).squeeze(-1)
+    any_imp = improves.any(dim=-1)
+    self_r = rows.view(1, -1, 1).expand(batch, height, width)
+    self_c = cols.view(1, 1, -1).expand(batch, height, width)
+    return torch.stack(
+        (
+            torch.where(any_imp, next_r, self_r),
+            torch.where(any_imp, next_c, self_c),
+        ),
+        dim=-1,
+    )
 
 
 def path_length_m(path: Sequence[tuple[int, int]], resolution: float) -> float:
@@ -529,14 +630,16 @@ def _clearance_penalty(occupied: torch.Tensor, radius: int, weight: float) -> to
         return torch.zeros_like(occupied, dtype=torch.float32)
     dist = torch.full(occupied.shape, float(radius + 1), dtype=torch.float32, device=occupied.device)
     dist = torch.where(occupied, torch.zeros_like(dist), dist)
+    # Ellipsis keeps a leading batch dimension on the last two axes. A single
+    # grid has none, so this is the same indexing as slicing the whole tensor.
     for _ in range(radius):
         padded = torch.nn.functional.pad(dist, (1, 1, 1, 1), value=float(radius + 1))
         neighbours = torch.stack(
             (
-                padded[:-2, 1:-1],
-                padded[2:, 1:-1],
-                padded[1:-1, :-2],
-                padded[1:-1, 2:],
+                padded[..., :-2, 1:-1],
+                padded[..., 2:, 1:-1],
+                padded[..., 1:-1, :-2],
+                padded[..., 1:-1, 2:],
             ),
             dim=0,
         )

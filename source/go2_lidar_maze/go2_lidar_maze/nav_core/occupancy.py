@@ -82,6 +82,28 @@ class OccupancyGrid:
         rel = (cell.to(torch.float32) - self._half + 0.5) * self._broadcast_res(cell)
         return rel + self._broadcast_origin(rel)
 
+    def known_bounds(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Inclusive cell bounds of walls and free space for ``env_ids``.
+
+        Returns ``lo`` and ``hi`` shaped ``(K, 2)`` as ``(row, col)``, and
+        ``has_free`` shaped ``(K,)``. An environment with no free cells has
+        ``has_free`` false. Bounds come from one reduction, not a scan per env.
+        """
+        counts = self.counts[env_ids]
+        free = self.free_counts[env_ids]
+        known = (counts >= self.hit_threshold) | (free > 0)
+        rows = known.any(dim=2)
+        cols = known.any(dim=1)
+        index = torch.arange(self.size, device=self.device)
+        row_lo = torch.where(rows, index, self.size).amin(dim=1)
+        row_hi = torch.where(rows, index, -1).amax(dim=1)
+        col_lo = torch.where(cols, index, self.size).amin(dim=1)
+        col_hi = torch.where(cols, index, -1).amax(dim=1)
+        lo = torch.stack((row_lo, col_lo), dim=-1)
+        hi = torch.stack((row_hi, col_hi), dim=-1)
+        has_free = (free > 0).flatten(1).any(dim=1)
+        return lo, hi, has_free
+
     def obstacle_mask(self) -> torch.Tensor:
         """Boolean wall mask ``(N, size, size)``."""
         return self.counts >= self.hit_threshold
@@ -113,8 +135,7 @@ class OccupancyGrid:
         cells = self.world_to_cell(ray_hits_w[..., :2])
         flat = cells[..., 0] * self.size + cells[..., 1]
         sink = self.size * self.size
-        self._index_add_cells(self.counts, flat, valid, sink)
-        self.counts.clamp_(max=1000)
+        hit_lin = self._index_add_cells(self.counts, flat, valid, sink)
 
         finite = torch.isfinite(dist) & (dist > 0.05)
         if free_samples is None:
@@ -138,18 +159,30 @@ class OccupancyGrid:
         inside = inside.reshape(self.num_envs, -1) & self.in_bounds(flat_pts)
         free_cells = self.world_to_cell(flat_pts)
         free_flat = free_cells[..., 0] * self.size + free_cells[..., 1]
-        self._index_add_cells(self.free_counts, free_flat, inside, sink)
-        self.free_counts.clamp_(max=1000)
+        free_lin = self._index_add_cells(self.free_counts, free_flat, inside, sink)
         # A cell that is both hit and traversed counts as a wall, not free.
-        self.free_counts.masked_fill_(self.obstacle_mask(), 0)
+        # Only the cells this scan touched can have changed, including a new
+        # wall that no free sample landed in.
+        both = torch.cat((hit_lin, free_lin))
+        counts_at = self.counts.view(-1).gather(0, both)
+        free_at = self.free_counts.view(-1).gather(0, both)
+        free_at = free_at.masked_fill(counts_at >= self.hit_threshold, 0)
+        self.free_counts.view(-1).scatter_(0, both, free_at)
 
-    def _index_add_cells(self, grid: torch.Tensor, flat: torch.Tensor, valid: torch.Tensor, sink: int) -> None:
-        """Add 1 to each valid flat cell. Invalid beams are left out, so no dense buffer is cleared."""
+    def _index_add_cells(self, grid: torch.Tensor, flat: torch.Tensor, valid: torch.Tensor, sink: int) -> torch.Tensor:
+        """Add 1 to each valid flat cell and clamp those cells to 1000.
+
+        Invalid beams contribute a zero weight, so they do not need a compacted
+        index list. Duplicate indices add first, then every write of a cell is
+        the same clamped value.
+        """
         env_ids = torch.arange(self.num_envs, device=self.device)[:, None].expand_as(flat)
-        lin = env_ids * sink + flat
-        lin = lin[valid]
-        ones = torch.ones(lin.shape[0], dtype=grid.dtype, device=self.device)
-        grid.view(-1).index_add_(0, lin, ones)
+        lin = (env_ids * sink + flat.clamp(0, sink - 1)).reshape(-1)
+        weight = valid.reshape(-1).to(dtype=grid.dtype)
+        flat_grid = grid.view(-1)
+        flat_grid.index_add_(0, lin, weight)
+        flat_grid.scatter_(0, lin, flat_grid.gather(0, lin).clamp(max=1000))
+        return lin
 
     def _broadcast_res(self, ref: torch.Tensor) -> torch.Tensor:
         shape = [self.num_envs] + [1] * (ref.dim() - 1)

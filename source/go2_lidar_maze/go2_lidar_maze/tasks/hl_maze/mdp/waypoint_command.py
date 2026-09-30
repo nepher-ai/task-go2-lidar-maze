@@ -30,7 +30,12 @@ from go2_lidar_maze.constants import (
     REACH_RADIUS_M,
     SPAWN_JITTER_M,
 )
-from go2_lidar_maze.nav_core.path_utils import cumulative_length, fillet_polyline, point_at_distance, resample_polyline
+from go2_lidar_maze.nav_core.path_utils import (
+    cumulative_length,
+    fillet_polyline,
+    points_at_arc_length,
+    resample_polyline,
+)
 from go2_lidar_maze.nav_core.stack import NavigationStack
 from go2_lidar_maze.tasks.hl_maze.lidar_frame import ray_origin_w
 
@@ -177,31 +182,29 @@ class WaypointCommand(CommandTerm):
         if not bool(need.any()):
             return
         self._stack.plan_mask(need, robot_xy, headings)
-        for index in need.nonzero(as_tuple=False).flatten().tolist():
-            waypoint = self._stack.planned_xy[index]
-            waiting = float(torch.linalg.norm(waypoint - robot_xy[index])) < REACH_RADIUS_M
-            # The scan has not opened a route yet. Burning the waypoint budget
-            # here ends the episode before the map exists.
-            if bool(latched[index]) and waiting:
-                self.time_on_waypoint[index] = 0.0
-                continue
-            old = self.waypoint_w[index]
-            moved = float(torch.linalg.norm(waypoint - old))
-            self.waypoint_w[index] = waypoint
-            self._write_online_path(index, self._stack.path_of(index))
-            # A wall that only grazes the route replans to the same point.
-            # Resetting the timer there makes the waypoint thrash.
-            if bool(latched[index]) or moved > 0.3:
-                self.s_bar[index] = 0.0
-                self.time_on_waypoint[index] = 0.0
-                self.bonus_paid[index] = False
-                self.issued_count[index] += 1.0
-                goal_dist = torch.linalg.norm(waypoint - self._env.goal_xy[index])
-                self.is_final[index] = bool(goal_dist < 0.3)
-                length = self.path_length[index].clamp(min=CELL_PITCH_M)
-                self.time_budget[index] = (length / 0.5 + 5.0).clamp(10.0, 30.0)
-            if waiting:
-                self.time_on_waypoint[index] = 0.0
+        waypoint = self._stack.planned_xy
+        waiting = torch.linalg.norm(waypoint - robot_xy, dim=-1) < REACH_RADIUS_M
+        # The scan has not opened a route yet. Burning the waypoint budget
+        # here ends the episode before the map exists.
+        skip = need & latched & waiting
+        apply = need & ~skip
+        moved = torch.linalg.norm(waypoint - self.waypoint_w, dim=-1)
+        # A wall that only grazes the route replans to the same point.
+        # Resetting the timer there makes the waypoint thrash.
+        reset = apply & (latched | (moved > 0.3))
+        self.waypoint_w = torch.where(apply.unsqueeze(-1), waypoint, self.waypoint_w)
+        self._write_online_paths(apply.nonzero(as_tuple=False).flatten())
+        self.s_bar = torch.where(reset, torch.zeros_like(self.s_bar), self.s_bar)
+        self.time_on_waypoint = torch.where(reset, torch.zeros_like(self.time_on_waypoint), self.time_on_waypoint)
+        self.bonus_paid = self.bonus_paid & ~reset
+        self.issued_count = self.issued_count + reset.to(self.issued_count.dtype)
+        goal_dist = torch.linalg.norm(self.waypoint_w - self._env.goal_xy, dim=-1)
+        self.is_final = torch.where(reset, goal_dist < 0.3, self.is_final)
+        length = self.path_length.clamp(min=CELL_PITCH_M)
+        budget = (length / 0.5 + 5.0).clamp(10.0, 30.0)
+        self.time_budget = torch.where(reset, budget, self.time_budget)
+        hold = (apply & waiting) | skip
+        self.time_on_waypoint = torch.where(hold, torch.zeros_like(self.time_on_waypoint), self.time_on_waypoint)
 
     def _issue(self, env_ids: Sequence[int]):
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
@@ -240,12 +243,10 @@ class WaypointCommand(CommandTerm):
         mask[ids] = True
         self._stack.field_ready[ids] = False
         self._stack.plan_mask(mask, robot_xy, _headings(self))
-        for index in ids.tolist():
-            waypoint = self._stack.planned_xy[index]
-            self.waypoint_w[index] = waypoint
-            self._write_online_path(index, self._stack.path_of(index))
-            goal_dist = torch.linalg.norm(waypoint - goal_xy[index])
-            self.is_final[index] = bool(goal_dist < 0.3)
+        self.waypoint_w[ids] = self._stack.planned_xy[ids]
+        self._write_online_paths(ids)
+        goal_dist = torch.linalg.norm(self.waypoint_w[ids] - goal_xy[ids], dim=-1)
+        self.is_final[ids] = goal_dist < 0.3
 
     def _store_path(self, index: int, points: torch.Tensor, is_final: bool):
         smoothed = fillet_polyline(points, radius=0.5)
@@ -271,11 +272,26 @@ class WaypointCommand(CommandTerm):
         timed_out = terms.get_term("time_out")[ids] | terms.get_term("waypoint_timeout")[ids]
         self.last_timeout[ids] = timed_out
 
-    def _write_online_path(self, index: int, path: torch.Tensor) -> None:
-        """Resample the first 15 m. A full maze path is too long for 64 points."""
-        prefix = _prefix_polyline(path, _ONLINE_PREFIX_M)
-        stored = resample_polyline(prefix, spacing=0.5, max_points=_MAX_POINTS)
-        self._write_path(index, stored)
+    def _write_online_paths(self, ids: torch.Tensor) -> None:
+        """Resample the first 15 m of each issued path onto the 64-point buffer.
+
+        ``ids`` selects environments. The tail past each path's own sample count
+        repeats that path's endpoint, matching :func:`resample_polyline`.
+        """
+        if ids.numel() == 0:
+            return
+        smooth = self._stack._smooth_xy[ids]
+        total = cumulative_length(smooth)[:, -1]
+        capped = torch.minimum(total, total.new_full(total.shape, _ONLINE_PREFIX_M))
+        count = (capped / 0.5).to(torch.long) + 1
+        count = count.clamp(min=2, max=_MAX_POINTS)
+        slot = torch.arange(_MAX_POINTS, device=self.device)
+        frac = slot.unsqueeze(0) / (count - 1).unsqueeze(1).to(torch.float32)
+        dist = frac * capped.unsqueeze(1)
+        dist = torch.where(slot.unsqueeze(0) < count.unsqueeze(1), dist, capped.unsqueeze(1))
+        self.path_xy[ids] = points_at_arc_length(smooth, dist)
+        steps = self.path_xy[ids, 1:] - self.path_xy[ids, :-1]
+        self.path_length[ids] = torch.linalg.norm(steps, dim=-1).sum(dim=-1)
 
     def _layout_or_build(self):
         if self._layout is None:
@@ -360,18 +376,3 @@ def _sample_pair(layout, start: int, k_max: int, choice: int, frontier_fraction:
             target, path = layout.sample(start, k, choice)
             return target, path, k
     raise RuntimeError(f"Cell {start} has no neighbour within {k_max} cells. The maze graph is disconnected.")
-
-
-def _prefix_polyline(points: torch.Tensor, max_length_m: float) -> torch.Tensor:
-    """Return the start of ``points``, cut at ``max_length_m`` [m]."""
-    cum = cumulative_length(points)
-    if float(cum[-1]) <= max_length_m:
-        return points
-    limit = torch.tensor(max_length_m, device=points.device, dtype=points.dtype)
-    end = point_at_distance(points, limit)
-    idx = int((cum < limit).sum().item())
-    idx = min(max(idx, 1), points.shape[0])
-    kept = points[:idx]
-    if float(torch.linalg.norm(kept[-1] - end)) < 1e-4:
-        return kept
-    return torch.cat((kept, end.unsqueeze(0)), dim=0)

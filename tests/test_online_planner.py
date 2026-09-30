@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 
 import torch
+from go2_lidar_maze.nav_core.occupancy import OccupancyGrid
 from go2_lidar_maze.nav_core.path_utils import commit_prefix
 from go2_lidar_maze.nav_core.planner import (
     UNREACHABLE,
@@ -17,9 +18,9 @@ from go2_lidar_maze.nav_core.planner import (
     distance_field,
     distance_field_batch,
     trace_route,
+    trace_route_batch,
 )
-from go2_lidar_maze.nav_core.occupancy import OccupancyGrid
-from go2_lidar_maze.nav_core.stack import NavigationStack
+from go2_lidar_maze.nav_core.stack import NavigationStack, _crop_bounds
 
 
 def _device() -> torch.device:
@@ -459,3 +460,112 @@ def test_commit_prefix_stops_before_a_wall():
     prefix, _last_seen = commit_prefix(points, seen, blocked, probe_m=2.5, max_m=15.0)
     assert prefix.shape[0] == 2
     assert float(prefix[-1, 0]) == 1.0
+
+
+def test_batched_field_trace_and_crops_match_one_env():
+    """A joint batch matches one grid, one trace, and one crop at a time.
+
+    Crop sizes and pool factors differ across the batch. Cells outside an
+    environment's own crop must not change its costs.
+    """
+    device = _device()
+    torch.manual_seed(4)
+    batch, height, width = 5, 21, 17
+    occupied = torch.rand((batch, height, width), device=device) < 0.2
+    goal = torch.randint(0, height, (batch, 2), device=device)
+    goal[:, 1].clamp_(max=width - 1)
+    rows = torch.arange(batch, device=device)
+    occupied[rows, goal[:, 0], goal[:, 1]] = False
+    step = torch.where(torch.rand((batch, height, width), device=device) < 0.3, 3.0, 1.0)
+    batched = distance_field_batch(occupied, goal, 0.25, step_cost=step, max_iters=400, check_every=400)
+    for index in range(batch):
+        single = distance_field(
+            occupied[index],
+            (int(goal[index, 0]), int(goal[index, 1])),
+            0.25,
+            step_cost=step[index],
+            max_iters=400,
+            check_every=400,
+        )
+        assert torch.allclose(batched[index], single, atol=1e-3, rtol=0.0)
+    starts = torch.randint(0, height, (batch, 2), device=device)
+    starts[:, 1].clamp_(max=width - 1)
+    cells, counts = trace_route_batch(batched, starts, resolution=0.25, max_length_m=6.0, max_steps=40)
+    for index in range(batch):
+        route = trace_route(
+            batched[index],
+            (int(starts[index, 0]), int(starts[index, 1])),
+            resolution=0.25,
+            max_length_m=6.0,
+            max_steps=40,
+        )
+        taken = int(counts[index])
+        assert cells[index, :taken].tolist() == [list(cell) for cell in route]
+
+    count = 3
+    stack = NavigationStack(count, device)
+    robots = torch.tensor([[10.0, 10.0], [12.0, 8.0], [30.0, 40.0]], device=device)
+    goals = torch.tensor([[18.0, 14.0], [40.0, 20.0], [70.0, 10.0]], device=device)
+    ids = torch.arange(count, device=device)
+    stack.reset(ids, robots, goals)
+    stack.grid.res[:] = torch.tensor([0.25, 0.25, 0.125], device=device)
+    for index in range(count):
+        robot = robots[index]
+        for step_i in range(12):
+            point = (robot + torch.tensor([0.4 * step_i, 0.15 * step_i], device=device)).view(1, 2)
+            cell = stack.grid.world_to_cell(point)[index]
+            stack.grid.free_counts[index, int(cell[0]), int(cell[1])] = 4
+        wall = (robot + torch.tensor([1.2, 2.0], device=device)).view(1, 2)
+        cell = stack.grid.world_to_cell(wall)[index]
+        stack.grid.counts[index, int(cell[0]), int(cell[1])] = 3
+    heading = torch.tensor([[0.0, 1.0], [1.0, 0.0], [0.0, 0.0]], device=device)
+    known_lo, known_hi, _has_free = stack.grid.known_bounds(ids)
+    r0, c0, r1, c1, factor, robot_rc, goal_rc = _crop_bounds(
+        robots,
+        goals,
+        stack.grid.origin,
+        stack.grid.res,
+        stack.grid._half,
+        stack.grid.size,
+        known_lo,
+        known_hi,
+    )
+    height_c = r1 - r0
+    width_c = c1 - c0
+    for value in factor.unique().tolist():
+        pick = (factor == int(value)).nonzero(as_tuple=False).flatten()
+        group = stack._build_group(
+            pick,
+            r0[pick],
+            c0[pick],
+            height_c[pick],
+            width_c[pick],
+            int(value),
+            robot_rc[pick],
+            goal_rc[pick],
+            stack.grid.res[pick],
+            stack.grid.origin[pick],
+            robots[pick],
+            heading[pick],
+        )
+        for local, index in enumerate(pick.tolist()):
+            slot = pick[local : local + 1]
+            solo = stack._build_group(
+                slot,
+                r0[slot],
+                c0[slot],
+                height_c[slot],
+                width_c[slot],
+                int(value),
+                robot_rc[slot],
+                goal_rc[slot],
+                stack.grid.res[slot],
+                stack.grid.origin[slot],
+                robots[slot],
+                heading[slot],
+            )
+            crop_h = int(solo["hc"][0])
+            crop_w = int(solo["wc"][0])
+            assert torch.equal(group["occupied"][local, :crop_h, :crop_w], solo["occupied"][0])
+            assert torch.equal(group["seen"][local, :crop_h, :crop_w], solo["seen"][0])
+            assert torch.allclose(group["step"][local, :crop_h, :crop_w], solo["step"][0], atol=1e-5, rtol=0.0)
