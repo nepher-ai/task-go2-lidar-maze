@@ -375,6 +375,8 @@ class Go2MazeEnvCfg_PLANNER_Envhub_PLAY(Go2MazeEnvCfg_PLANNER):
         self.fixed_spawn = False
         self.episode_length_s = 300.0
         self.events.reset_robot = EventTerm(func=hl_mdp.events.reset_go2_from_scenario, mode="reset")
+        # A window draws each tile's start, its maze goal, and the current target waypoint.
+        self.vis_start_goal = True
         # Planner play does not read the wall-filtered contact matrix.
         self.scene.contact_forces.filter_prim_paths_expr = []
 

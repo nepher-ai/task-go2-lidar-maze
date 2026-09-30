@@ -43,7 +43,7 @@ Gym ids:
 
 Isaac Lab 3 does not have a `--headless` flag. `--viz none` runs without a window. Leave it off for the high-level task and the window can draw every robot: a line for each LiDAR beam, a sphere where that beam hits the maze, the ground, or the robot, a green sphere at that episode's spawn, and a red sphere at its waypoint.
 
-Each of those drawings has its own switch, and each defaults to off. Append any of `env.vis_lidar_beams=true`, `env.vis_lidar_hits=true`, and `env.vis_start_goal=true` to the play command.
+Each of those drawings has its own switch, and each defaults to off. Append any of `env.vis_lidar_beams=true`, `env.vis_lidar_hits=true`, and `env.vis_start_goal=true` to the play command. `Nepher-Go2-LidarMaze-Planner-Envhub-Play-v0` turns the start and goal drawing on by itself when a window is open. That drawing is a green sphere on each tile's maze start, a red sphere on that tile's maze goal, and a blue sphere on the current target waypoint. The points sampled along the path are not drawn. `--viz none` still skips it.
 
 ```powershell
 .\isaaclab.bat train --task Nepher-Go2-LidarMaze-LL-v0 --viz none
