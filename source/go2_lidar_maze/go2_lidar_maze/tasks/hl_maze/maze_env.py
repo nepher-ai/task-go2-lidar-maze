@@ -33,6 +33,10 @@ class Go2MazeEnv(ManagerBasedRLEnv):
     """Maze env that publishes the goal tensor before the first reset."""
 
     def __init__(self, cfg: Go2MazeEnvCfg, render_mode: str | None = None, **kwargs):
+        # Ampere and Ada TF32 tensor cores do not match. Full FP32 keeps the LSTM
+        # and the frozen velocity net on one path. Set before the env builds that net.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         num_envs = cfg.scene.num_envs
         device = cfg.sim.device
         self.goal_xy = torch.zeros((num_envs, 2), device=device)

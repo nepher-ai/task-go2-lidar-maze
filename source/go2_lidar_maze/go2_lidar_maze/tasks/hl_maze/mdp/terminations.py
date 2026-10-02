@@ -43,3 +43,16 @@ def waypoint_reached(env, command_name: str) -> torch.Tensor:
     issued = term.issued_count.clamp(min=1.0)
     term.metrics["waypoint_success"][:] = term.reached_count / issued
     return arrived
+
+
+def sustained_illegal_contact(env, threshold: float, sensor_cfg) -> torch.Tensor:
+    """True when one body stays above ``threshold`` [N] for every stored contact frame.
+
+    ``illegal_contact`` ends the episode on the strongest frame in the history. A
+    one-frame graze near 1 N changes between PhysX builds, so benchmark play uses
+    this instead.
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_normal_forces_w_history.torch
+    norms = torch.linalg.norm(forces[:, :, sensor_cfg.body_ids], dim=-1)
+    return torch.any(torch.all(norms > threshold, dim=1), dim=1)
