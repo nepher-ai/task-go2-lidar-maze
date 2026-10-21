@@ -34,10 +34,12 @@ MOVE_S = 2.0
 
 OVERVIEW_MARGIN = 1.08
 # Ground span used to size a maze. The fill shot is raised further so the
-# outer walls are in frame; the follow shot keeps the unscaled height.
+# outer walls are in frame.
 FILL_MARGIN = 1.08
 FILL_HEIGHT_SCALE = 1.5
-FOLLOW_HEIGHT_SCALE = 0.8
+# Follow eye height [m]. A maze-sized height leaves a white speck, so this is
+# fixed. Walls are 1 m; 2.5 m stays above them and frames the head, trunk, and legs.
+FOLLOW_HEIGHT_M = 2.5
 # Follow lookat lags the robot so the frame does not chatter.
 FOLLOW_LAG_S = 0.30
 
@@ -175,12 +177,14 @@ def fill_pose(tile: TileGeom, vfov_rad: float, hfov_rad: float) -> Pose:
 
 
 def follow_pose(tile: TileGeom, look_xy: tuple[float, float], vfov_rad: float, hfov_rad: float) -> Pose:
-    """Lower than the filled maze, looking at ``look_xy``.
+    """Close shot on ``look_xy``, low enough to read the Go2's shape.
 
-    Height is the fitted maze height times :data:`FOLLOW_HEIGHT_SCALE`. It does
-    not use :data:`FILL_HEIGHT_SCALE`, and it does not change as the robot moves.
+    Height is :data:`FOLLOW_HEIGHT_M` on every maze. It does not use the fitted
+    maze height, and it does not change as the robot moves. ``tile`` and
+    ``hfov_rad`` size the other shots.
     """
-    height = height_to_frame_tile(tile, tile.center, vfov_rad, hfov_rad) * FOLLOW_HEIGHT_SCALE
+    del tile, hfov_rad
+    height = FOLLOW_HEIGHT_M
     look_y = look_y_for_centered_span(look_xy[1], height, vfov_rad)
     return nadir_pose(look_xy[0], look_y, height)
 

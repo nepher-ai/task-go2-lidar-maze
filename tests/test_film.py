@@ -118,10 +118,11 @@ def test_one_maze_stays_inside_the_frame_on_both_axes():
     assert abs(pose.eye[2] - framed * film.FILL_HEIGHT_SCALE) < 1e-6
     corner = (tile.origin_x + 0.2, tile.origin_y + 0.2)
     follow = film.follow_pose(tile, corner, vfov, hfov)
-    assert abs(follow.eye[2] - framed * film.FOLLOW_HEIGHT_SCALE) < 1e-6
+    assert abs(follow.eye[2] - film.FOLLOW_HEIGHT_M) < 1e-6
+    assert follow.eye[2] < framed
 
 
-def test_follow_tracks_the_robot_without_cropping_the_maze():
+def test_follow_tracks_the_robot_from_a_close_height():
     film = _film()
     tiles = _tiles(film)
     vfov, hfov = film.fallback_fov()
@@ -134,7 +135,7 @@ def test_follow_tracks_the_robot_without_cropping_the_maze():
     assert pose == film.follow_pose(tiles[3], robot, vfov, hfov)
     framed = film.height_to_frame_tile(tiles[3], tiles[3].center, vfov, hfov)
     assert abs(fill.eye[2] - framed * film.FILL_HEIGHT_SCALE) < 1e-6
-    assert abs(pose.eye[2] - framed * film.FOLLOW_HEIGHT_SCALE) < 1e-6
+    assert abs(pose.eye[2] - film.FOLLOW_HEIGHT_M) < 1e-6
 
 
 def test_descent_onto_the_robot_does_not_cut():
